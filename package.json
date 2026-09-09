@@ -1,0 +1,24 @@
+{
+  "name": "question-bank-server",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Question Bank Admin API — Express + Supabase backend",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "seed": "node seed.js",
+    "seed:master": "node seedMasterData.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.112.4",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "nodemailer": "^9.0.6"
+  }
+}

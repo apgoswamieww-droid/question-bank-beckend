@@ -401,6 +401,59 @@ export async function deleteSubject(id) {
 }
 
 // ---------------------------------------------------------------------------
+// Master Data: Standard ↔ Subject mapping
+// ---------------------------------------------------------------------------
+export async function listStandardSubjects({ standard_id, subject_id } = {}) {
+  if (!client) return [];
+  let query = client
+    .from("standard_subjects")
+    .select("*, subject:subjects(id, name, icon, color, sort_order, active)")
+    .order("sort_order");
+  if (standard_id) query = query.eq("standard_id", standard_id);
+  if (subject_id) query = query.eq("subject_id", subject_id);
+  const { data, error } = await query;
+  if (error) throw new Error(`Supabase standard_subjects.list: ${error.message}`);
+  return data;
+}
+
+// Create mappings for a subject (idempotent: skips existing pairs).
+export async function linkSubjectToStandards(subjectId, standardIds) {
+  if (!client) throw new Error("Supabase not configured");
+  const ids = [...new Set((standardIds || []).filter(Boolean))];
+  if (!ids.length) return [];
+  const rows = ids.map((standard_id, i) => ({ standard_id, subject_id: subjectId, sort_order: i }));
+  const { data, error } = await client
+    .from("standard_subjects")
+    .upsert(rows, { onConflict: "standard_id,subject_id", ignoreDuplicates: true })
+    .select();
+  if (error) throw new Error(`Supabase standard_subjects.link: ${error.message}`);
+  return data || [];
+}
+
+// Replace the full standard set for a subject.
+export async function replaceSubjectStandards(subjectId, standardIds) {
+  if (!client) throw new Error("Supabase not configured");
+  const { data: current, error: selErr } = await client
+    .from("standard_subjects")
+    .select("id, standard_id")
+    .eq("subject_id", subjectId);
+  if (selErr) throw new Error(`Supabase standard_subjects.select: ${selErr.message}`);
+
+  const nextIds = new Set(standardIds || []);
+  const toDelete = (current || []).filter((row) => !nextIds.has(row.standard_id));
+
+  if (toDelete.length) {
+    const { error: delErr } = await client
+      .from("standard_subjects")
+      .delete()
+      .in("id", toDelete.map((r) => r.id));
+    if (delErr) throw new Error(`Supabase standard_subjects.delete: ${delErr.message}`);
+  }
+  await linkSubjectToStandards(subjectId, [...nextIds]);
+  return listStandardSubjects({ subject_id: subjectId });
+}
+
+// ---------------------------------------------------------------------------
 // Master Data: Chapters
 // ---------------------------------------------------------------------------
 export async function listChapters({ subject_id, standard_id } = {}) {
@@ -639,6 +692,7 @@ const rowToQuestion = (row) => ({
   tags: row.tags ?? [],
   status: row.status,
   sort_order: row.sort_order,
+  family_id: row.family_id || null,
   created_at: row.created_at,
   updated_at: row.updated_at,
 });
@@ -647,9 +701,18 @@ export async function createQuestion({
   bank_id, created_by, standard_id, subject_id, chapter_id, topic_id,
   type, exam_type_id, language_id, difficulty, level_id, exam_year,
   content, explanation, image_url, marks, negative_marks, time_limit_sec,
-  tags, status, sort_order,
+  tags, status, sort_order, family_id,
 }) {
   if (!client) throw new Error("Supabase not configured");
+
+  // Every question belongs to a family so papers can resolve translations.
+  // If no family is provided, auto-create one and attach this question to it.
+  let resolvedFamilyId = family_id || null;
+  if (!resolvedFamilyId) {
+    const family = await createQuestionFamily(created_by);
+    resolvedFamilyId = family.id;
+  }
+
   const { data, error } = await client.from("questions")
     .insert({
       bank_id: bank_id || null,
@@ -673,6 +736,7 @@ export async function createQuestion({
       tags: tags ?? [],
       status: status || "draft",
       sort_order: sort_order ?? 0,
+      family_id: resolvedFamilyId,
     })
     .select()
     .single();
@@ -697,8 +761,10 @@ function applyQuestionFilters(query, filters = {}) {
     search, q,
     min_marks, max_marks, min_negative_marks, max_negative_marks,
     created_from, created_to, updated_from, updated_to,
+    family_id,
   } = filters;
 
+  if (family_id) query = query.eq("family_id", family_id);
   if (bank_id) query = query.eq("bank_id", bank_id);
   if (standard_id) query = query.eq("standard_id", standard_id);
   if (subject_id) query = query.eq("subject_id", subject_id);
@@ -1334,4 +1400,243 @@ export async function countTests() {
   const { count, error } = await client.from("tests").select("id", { count: "exact", head: true });
   if (error) throw new Error(`Supabase tests.count: ${error.message}`);
   return count ?? 0;
+}
+
+// ---------------------------------------------------------------------------
+// Question families & Papers — multi-language "same question paper" (Phase 8)
+// ---------------------------------------------------------------------------
+
+export async function createQuestionFamily(createdBy) {
+  if (!client) throw new Error("Supabase not configured");
+  const { data, error } = await client.from("question_families")
+    .insert({ created_by: createdBy || null })
+    .select().single();
+  if (error) throw new Error(`Supabase question_families.create: ${error.message}`);
+  return data;
+}
+
+export async function listQuestionVariants(familyId) {
+  if (!client) return [];
+  const { data, error } = await client.from("questions")
+    .select("*")
+    .eq("family_id", familyId)
+    .order("created_at", { ascending: true });
+  if (error) throw new Error(`Supabase question_families.variants: ${error.message}`);
+  const variants = [];
+  for (const row of data || []) {
+    const q = rowToQuestion(row);
+    const options = await listQuestionOptions(q.id);
+    const payload = await getQuestionPayload(q.id);
+    variants.push({ ...q, options, payload: payload?.payload ?? null });
+  }
+  return variants;
+}
+
+// Link an existing question into a variant family. Creates the family when
+// none exists (or the supplied id is unknown), so all variants share one family.
+export async function linkQuestionToFamily(questionId, familyId) {
+  if (!client) throw new Error("Supabase not configured");
+  const question = await getQuestionById(questionId);
+  if (!question) return null;
+  let resolvedFamilyId = familyId || null;
+  if (resolvedFamilyId) {
+    const { error } = await client.from("question_families")
+      .select("id").eq("id", resolvedFamilyId).maybeSingle();
+    if (error) {
+      const family = await createQuestionFamily(question.created_by);
+      resolvedFamilyId = family.id;
+    }
+  } else {
+    const family = await createQuestionFamily(question.created_by);
+    resolvedFamilyId = family.id;
+  }
+  const { error } = await client.from("questions")
+    .update({ family_id: resolvedFamilyId })
+    .eq("id", questionId);
+  if (error) throw new Error(`Supabase questions.link: ${error.message}`);
+  const linked = await getQuestionById(questionId);
+  if (!linked) return null;
+  return { question: linked, family_id: linked.family_id };
+}
+
+const rowToPaper = (row) => ({
+  id: row.id,
+  title: row.title,
+  description: row.description,
+  standard_id: row.standard_id,
+  subject_id: row.subject_id,
+  exam_type_id: row.exam_type_id,
+  duration_min: row.duration_min,
+  total_marks: row.total_marks,
+  status: row.status,
+  created_by: row.created_by,
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+});
+
+async function listPaperFamilyRows(paperId) {
+  const { data, error } = await client.from("paper_families")
+    .select("*")
+    .eq("paper_id", paperId)
+    .order("sort_order", { ascending: true });
+  if (error) throw new Error(`Supabase paper_families.list: ${error.message}`);
+  return data || [];
+}
+
+export async function listPapers({ status, created_by, limit = 100, offset = 0 } = {}) {
+  if (!client) return { papers: [], total: 0 };
+  let query = client.from("papers").select(
+    "id, title, description, standard_id, subject_id, exam_type_id, duration_min, total_marks, status, created_by, created_at, updated_at, paper_families(count)"
+  ).order("created_at", { ascending: false });
+  if (status) query = query.eq("status", status);
+  if (created_by) query = query.eq("created_by", created_by);
+  query = query.range(offset, offset + limit - 1);
+  const { data, error } = await query;
+  if (error) throw new Error(`Supabase papers.list: ${error.message}`);
+  const papers = (data ?? []).map((r) => ({
+    ...rowToPaper(r),
+    question_count: r.paper_families?.[0]?.count ?? 0,
+  }));
+  const { count, error: countErr } = await client.from("papers").select("id", { count: "exact", head: true });
+  if (countErr) throw new Error(`Supabase papers.count: ${countErr.message}`);
+  return { papers, total: count ?? 0 };
+}
+
+async function paperByIdWithFamilies(id) {
+  const { data, error } = await client.from("papers")
+    .select("id, title, description, standard_id, subject_id, exam_type_id, duration_min, total_marks, status, created_by, created_at, updated_at")
+    .eq("id", id).maybeSingle();
+  if (error) throw new Error(`Supabase papers.get: ${error.message}`);
+  if (!data) return null;
+  const rows = await listPaperFamilyRows(id);
+  const families = [];
+  for (const row of rows) {
+    let primary = null;
+    let variants = [];
+    const base = { id: row.id, family_id: row.family_id, sort_order: row.sort_order, marks: row.marks };
+    try {
+      variants = await listQuestionVariants(row.family_id);
+    } catch {
+      variants = [];
+    }
+    if (variants.length) {
+      primary = variants.find((v) => v.language_id) || variants[0];
+    }
+    families.push({ ...base, primary, variants });
+  }
+  return { paper: rowToPaper(data), families };
+}
+
+export async function getPaperById(id) {
+  if (!client) return null;
+  return paperByIdWithFamilies(id);
+}
+
+export async function createPaper({
+  title, description, standard_id, subject_id, exam_type_id,
+  duration_min, total_marks, status, created_by, familyIds,
+}) {
+  if (!client) throw new Error("Supabase not configured");
+  const { data, error } = await client.from("papers")
+    .insert({
+      title,
+      description: description || null,
+      standard_id: standard_id || null,
+      subject_id: subject_id || null,
+      exam_type_id: exam_type_id || null,
+      duration_min: duration_min ?? 120,
+      total_marks: total_marks ?? 0,
+      status: status || "draft",
+      created_by,
+    })
+    .select().single();
+  if (error) throw new Error(`Supabase papers.create: ${error.message}`);
+  await replacePaperFamilies(data.id, familyIds ?? []);
+  return paperByIdWithFamilies(data.id);
+}
+
+export async function replacePaperFamilies(paperId, familyIds) {
+  if (!client) return;
+  await client.from("paper_families").delete().eq("paper_id", paperId);
+  if (!familyIds.length) return;
+  const rows = familyIds.map((familyId, i) => ({
+    paper_id: paperId,
+    family_id: familyId,
+    sort_order: i,
+    marks: 0,
+  }));
+  const { error } = await client.from("paper_families").insert(rows);
+  if (error) throw new Error(`Supabase paper_families.replace: ${error.message}`);
+}
+
+export async function updatePaper(id, patch, familyIds) {
+  if (!client) return null;
+  const dbPatch = {};
+  const fieldMap = {
+    title: "title", description: "description",
+    standard_id: "standard_id", subject_id: "subject_id",
+    exam_type_id: "exam_type_id", duration_min: "duration_min",
+    total_marks: "total_marks", status: "status",
+  };
+  for (const [key, col] of Object.entries(fieldMap)) {
+    if (patch[key] !== undefined) dbPatch[col] = patch[key];
+  }
+  if (Object.keys(dbPatch).length) {
+    const { error } = await client.from("papers").update(dbPatch).eq("id", id);
+    if (error) throw new Error(`Supabase papers.update: ${error.message}`);
+  }
+  if (familyIds !== undefined) {
+    await replacePaperFamilies(id, familyIds);
+  }
+  return paperByIdWithFamilies(id);
+}
+
+export async function deletePaper(id) {
+  if (!client) return false;
+  const { error } = await client.from("papers").delete().eq("id", id);
+  if (error) throw new Error(`Supabase papers.delete: ${error.message}`);
+  return true;
+}
+
+export async function getPaperLanguages(id) {
+  if (!client) return { languages: [], coverage: [] };
+  const rows = await listPaperFamilyRows(id);
+  const coverage = [];
+  const languageSet = new Set();
+  for (const row of rows) {
+    try {
+      const variants = await listQuestionVariants(row.family_id);
+      const langs = variants.map((v) => v.language_id).filter(Boolean);
+      langs.forEach((l) => languageSet.add(l));
+      coverage.push({ family_id: row.family_id, languages: langs });
+    } catch {
+      coverage.push({ family_id: row.family_id, languages: [] });
+    }
+  }
+  return { languages: [...languageSet], coverage };
+}
+
+export async function getPaperInLanguage(id, languageId) {
+  if (!client) return null;
+  const loaded = await paperByIdWithFamilies(id);
+  if (!loaded) return null;
+  const questions = [];
+  const missingLangs = new Set();
+  for (const fam of loaded.families) {
+    let variant = (fam.variants || []).find((v) => v.language_id === languageId);
+    if (!variant && fam.variants?.length) variant = fam.variants[0];
+    if (variant) {
+      questions.push({
+        id: fam.id,
+        family_id: fam.family_id,
+        sort_order: fam.sort_order,
+        marks: fam.marks || variant.marks,
+        resolved_language_id: variant.language_id,
+        question: variant,
+      });
+    } else {
+      missingLangs.add(fam.family_id);
+    }
+  }
+  return { paper: loaded.paper, questions, missing_families: [...missingLangs] };
 }

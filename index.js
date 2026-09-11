@@ -96,8 +96,21 @@ import {
   deleteLanguage,
   listSchools,
   createSchool,
+  listStandardSubjects,
+  linkSubjectToStandards,
+  replaceSubjectStandards,
   updateSchool,
   deleteSchool,
+  // Question families & papers (multi-language)
+  listQuestionVariants,
+  linkQuestionToFamily,
+  listPapers,
+  getPaperById,
+  createPaper,
+  updatePaper,
+  deletePaper,
+  getPaperLanguages,
+  getPaperInLanguage,
 } from "./supabase.js";
 
 const VALID_ROLES = new Set(["super_admin", "teacher", "student"]);
@@ -720,9 +733,12 @@ app.get("/api/admin/subjects", requireAuth, async (_req, res, next) => {
 
 app.post("/api/admin/subjects", requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
-    const { name, icon, color, sort_order } = req.body ?? {};
+    const { name, icon, color, sort_order, standard_ids } = req.body ?? {};
     if (!isSafeIdentifier(name)) return res.status(400).json({ error: "Name is required.", code: "VALIDATION" });
     const created = await createSubject({ name: name.trim(), icon, color, sort_order: sort_order ?? 0 });
+    if (Array.isArray(standard_ids) && standard_ids.length) {
+      await linkSubjectToStandards(created.id, standard_ids);
+    }
     res.status(201).json({ subject: created });
   } catch (err) {
     if (String(err?.message || "").includes("duplicate")) return res.status(409).json({ error: "Subject already exists.", code: "DUPLICATE" });
@@ -732,9 +748,12 @@ app.post("/api/admin/subjects", requireAuth, requireSuperAdmin, async (req, res,
 
 app.patch("/api/admin/subjects/:id", requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
-    const { name, icon, color, sort_order, active } = req.body ?? {};
+    const { name, icon, color, sort_order, active, standard_ids } = req.body ?? {};
     const updated = await updateSubject(req.params.id, { name, icon, color, sort_order, active });
     if (!updated) return res.status(404).json({ error: "Not found.", code: "NOT_FOUND" });
+    if (Array.isArray(standard_ids)) {
+      await replaceSubjectStandards(req.params.id, standard_ids);
+    }
     res.json({ subject: updated });
   } catch (err) { next(err); }
 });
@@ -963,6 +982,17 @@ app.delete("/api/admin/schools/:id", requireAuth, requireSuperAdmin, async (req,
 });
 
 // ---------------------------------------------------------------
+// Admin: Master Data — Standard ↔ Subject mapping
+// ---------------------------------------------------------------
+app.get("/api/admin/standard-subjects", requireAuth, async (req, res, next) => {
+  try {
+    const { standard_id, subject_id } = req.query ?? {};
+    const mappings = await listStandardSubjects({ standard_id, subject_id });
+    res.json({ mappings });
+  } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
 // Admin: Questions CRUD
 // ---------------------------------------------------------------
 const VALID_QUESTION_TYPES = new Set([
@@ -987,6 +1017,7 @@ app.post("/api/admin/questions", requireAuth, requirePermission(PERMISSIONS.QUES
       content: b.content, explanation: b.explanation, image_url: b.image_url,
       marks: b.marks, negative_marks: b.negative_marks, time_limit_sec: b.time_limit_sec,
       tags: b.tags, status: b.status, sort_order: b.sort_order,
+      family_id: b.family_id,
     });
     // Save options if provided
     if (Array.isArray(b.options) && b.options.length > 0) {
@@ -1021,7 +1052,7 @@ app.get("/api/admin/questions", requireAuth, requirePermission(PERMISSIONS.QUEST
       bank_id, standard_id, subject_id, chapter_id, topic_id, type, difficulty,
       level_id, exam_type_id, language_id, exam_year, status, tags, created_by,
       search, q, min_marks, max_marks, min_negative_marks, max_negative_marks,
-      created_from, created_to, updated_from, updated_to,
+      created_from, created_to, updated_from, updated_to, family_id,
       with_usage, limit, offset,
     } = req.query ?? {};
     const filters = {};
@@ -1030,6 +1061,7 @@ app.get("/api/admin/questions", requireAuth, requirePermission(PERMISSIONS.QUEST
     if (subject_id) filters.subject_id = subject_id;
     if (chapter_id) filters.chapter_id = chapter_id;
     if (topic_id) filters.topic_id = topic_id;
+    if (family_id) filters.family_id = family_id;
     if (type) filters.type = type;
     if (difficulty) filters.difficulty = difficulty;
     if (level_id) filters.level_id = level_id;
@@ -1279,6 +1311,120 @@ app.delete("/api/admin/tests/:id", requireAuth, requirePermission(PERMISSIONS.QU
     const removed = await deleteTest(req.params.id);
     if (!removed) return res.status(404).json({ error: "Test not found.", code: "NOT_FOUND" });
     res.json({ deleted: true });
+  } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
+// Admin: Papers (multi-language question papers)
+// ---------------------------------------------------------------
+app.get("/api/admin/papers", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_VIEW), async (req, res, next) => {
+  try {
+    const { status, limit, offset } = req.query ?? {};
+    const isSuperAdmin = req.user?.role === "super_admin";
+    const result = await listPapers({
+      status: typeof status === "string" ? status : undefined,
+      created_by: isSuperAdmin ? undefined : req.user.sub,
+      limit: parseInt(limit, 10) || 100,
+      offset: parseInt(offset, 10) || 0,
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+app.post("/api/admin/papers", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_MANAGE), async (req, res, next) => {
+  try {
+    const b = req.body ?? {};
+    if (!isSafeIdentifier(b.title)) return res.status(400).json({ error: "Title is required.", code: "VALIDATION" });
+    const familyIds = Array.isArray(b.familyIds) ? b.familyIds.filter((x) => typeof x === "string") : [];
+    const created = await createPaper({
+      title: b.title.trim(),
+      description: isSafeOptional(b.description, 2000) ? b.description : undefined,
+      standard_id: isSafeOptional(b.standard_id) ? b.standard_id : undefined,
+      subject_id: isSafeOptional(b.subject_id) ? b.subject_id : undefined,
+      exam_type_id: isSafeOptional(b.exam_type_id) ? b.exam_type_id : undefined,
+      duration_min: b.duration_min,
+      total_marks: b.total_marks,
+      status: b.status || "draft",
+      created_by: req.user.sub,
+      familyIds,
+    });
+    res.status(201).json(created);
+  } catch (err) { next(err); }
+});
+
+app.get("/api/admin/papers/:id", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_VIEW), async (req, res, next) => {
+  try {
+    const result = await getPaperById(req.params.id);
+    if (!result) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+app.patch("/api/admin/papers/:id", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_MANAGE), async (req, res, next) => {
+  try {
+    const existing = await getPaperById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    const b = req.body ?? {};
+    if (b.title !== undefined && !isSafeIdentifier(b.title)) return res.status(400).json({ error: "Title is required.", code: "VALIDATION" });
+    const patch = {};
+    for (const key of ["title", "description", "standard_id", "subject_id", "exam_type_id", "duration_min", "total_marks", "status"]) {
+      if (b[key] !== undefined) patch[key] = b[key];
+    }
+    const familyIds = Array.isArray(b.familyIds) ? b.familyIds.filter((x) => typeof x === "string") : undefined;
+    const updated = await updatePaper(req.params.id, patch, familyIds);
+    res.json(updated);
+  } catch (err) { next(err); }
+});
+
+app.delete("/api/admin/papers/:id", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_MANAGE), async (req, res, next) => {
+  try {
+    const removed = await deletePaper(req.params.id);
+    if (!removed) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    res.json({ deleted: true });
+  } catch (err) { next(err); }
+});
+
+// Key endpoint: paper resolved to a requested language. Any authenticated
+// teacher can print a paper; the resolved content excludes answer keys.
+app.get("/api/admin/papers/:id/print", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_VIEW), async (req, res, next) => {
+  try {
+    const { language } = req.query ?? {};
+    if (!language || typeof language !== "string") {
+      return res.status(400).json({ error: "language query param is required.", code: "VALIDATION" });
+    }
+    const result = await getPaperInLanguage(req.params.id, language);
+    if (!result) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+app.get("/api/admin/papers/:id/languages", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_VIEW), async (req, res, next) => {
+  try {
+    const result = await getPaperLanguages(req.params.id);
+    if (!result) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// Question family variants — list all language versions of a question's family
+app.get("/api/admin/questions/:id/variants", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_VIEW), async (req, res, next) => {
+  try {
+    const question = await getQuestionById(req.params.id);
+    if (!question) return res.status(404).json({ error: "Question not found.", code: "NOT_FOUND" });
+    if (!question.family_id) {
+      return res.json({ family_id: null, variants: [question] });
+    }
+    const variants = await listQuestionVariants(question.family_id);
+    res.json({ family_id: question.family_id, variants });
+  } catch (err) { next(err); }
+});
+
+// Question family variants — link an existing question into a variant family
+app.post("/api/admin/questions/:id/link-variant", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_VIEW), async (req, res, next) => {
+  try {
+    const result = await linkQuestionToFamily(req.params.id, req.body?.family_id);
+    if (!result) return res.status(404).json({ error: "Question not found.", code: "NOT_FOUND" });
+    res.json({ question: result.question, family_id: result.family_id });
   } catch (err) { next(err); }
 });
 

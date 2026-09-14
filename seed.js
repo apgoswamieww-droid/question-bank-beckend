@@ -5,6 +5,7 @@ import {
   listUsers,
   createUser,
   setRolePermissions,
+  paperPermissionsForLegacy,
 } from "./supabase.js";
 
 /**
@@ -33,7 +34,26 @@ const PERMISSION_ROWS = [
   ["question_banks.view", "View question banks", "View question bank contents"],
   ["question_banks.manage", "Manage question banks", "Create and edit question banks"],
   ["settings.view", "View settings", "View platform settings"],
+  // Paper Generator (Phase 17) — same codes as supabase.js PERMISSIONS.
+  ["papers.view", "View papers", "View papers, structure, versions, analysis and print data in the Paper Generator"],
+  ["papers.manage", "Manage papers", "Create, edit, duplicate, validate, archive and restore papers"],
+  ["papers.delete", "Delete papers", "Delete papers that are not published"],
+  ["papers.publish", "Publish papers", "Validate and publish papers"],
+  ["papers.generate", "Generate papers", "Generate paper questions from blueprints and randomization sets"],
+  ["papers.export", "Export paper PDFs", "Export papers as PDF files"],
+  ["papers.templates.manage", "Manage paper templates", "Create, edit and delete saved paper templates"],
+  ["papers.translations.manage", "Manage paper translations", "Manage translation readiness and generate language papers"],
+  ["papers.reports.view", "View paper reports", "View paper answer keys and solutions reports"],
 ];
+
+// Paper Generator defaults per role, derived from each role's legacy
+// question_banks access so seeded roles match migration 014's mapping.
+const PAPER_PERMISSION_DEFAULTS = Object.fromEntries(
+  Object.entries(ROLE_DEFAULTS).map(([role, perms]) => [
+    role,
+    paperPermissionsForLegacy(perms),
+  ])
+);
 
 function randomPassword() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$";
@@ -59,9 +79,10 @@ async function seedSupabase() {
     if (error) throw new Error(`seed permissions: ${error.message}`);
   }
 
-  // 3. Role permissions
+  // 3. Role permissions — legacy set + Paper Generator mapping (Phase 17) in
+  // ONE call: setRolePermissions replaces the role's whole set.
   for (const [role, perms] of Object.entries(ROLE_DEFAULTS)) {
-    await setRolePermissions(role, perms);
+    await setRolePermissions(role, [...perms, ...PAPER_PERMISSION_DEFAULTS[role] ?? []]);
   }
 
   // 4. Super admin user

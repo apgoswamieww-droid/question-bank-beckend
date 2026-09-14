@@ -11,7 +11,8 @@
     "start": "node index.js",
     "dev": "node --watch index.js",
     "seed": "node seed.js",
-    "seed:master": "node seedMasterData.js"
+    "seed:master": "node seedMasterData.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.4",
@@ -19,6 +20,8 @@
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
-    "nodemailer": "^9.0.6"
+    "katex": "^0.18.7",
+    "nodemailer": "^9.0.6",
+    "puppeteer": "^25.10.0"
   }
 }

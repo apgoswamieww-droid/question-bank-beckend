@@ -61,6 +61,8 @@ export const config = {
   },
   // Loaded at startup from users.json (seeded via seed.js) — fallback only.
   usersFile: path.join(__dirname, "data", "users.json"),
+  // Custom roles created in fallback mode (system roles stay hardcoded).
+  rolesFile: path.join(__dirname, "data", "roles.json"),
   // One-time password-reset tokens (fallback storage).
   resetsFile: path.join(__dirname, "data", "resets.json"),
 };

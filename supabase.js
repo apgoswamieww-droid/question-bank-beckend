@@ -38,6 +38,15 @@ export const PERMISSIONS = {
   ANALYTICS_VIEW: "analytics.view",
   MASTER_DATA_VIEW: "master_data.view",
   MASTER_DATA_MANAGE: "master_data.manage",
+  PAPERS_VIEW: "papers.view",
+  PAPERS_MANAGE: "papers.manage",
+  PAPERS_DELETE: "papers.delete",
+  PAPERS_PUBLISH: "papers.publish",
+  PAPERS_GENERATE: "papers.generate",
+  PAPERS_EXPORT: "papers.export",
+  PAPERS_TEMPLATES_MANAGE: "papers.templates.manage",
+  PAPERS_TRANSLATIONS_MANAGE: "papers.translations.manage",
+  PAPERS_REPORTS_VIEW: "papers.reports.view",
   SETTINGS_VIEW: "settings.view",
   SETTINGS_MANAGE: "settings.manage",
 };
@@ -57,12 +66,64 @@ export const PERMISSION_MODULE_MAP = {
   "analytics.view": "Analytics & Reports",
   "master_data.view": "Academic Hierarchy",
   "master_data.manage": "Academic Hierarchy",
+  "papers.view": "Paper Generator",
+  "papers.manage": "Paper Generator",
+  "papers.delete": "Paper Generator",
+  "papers.publish": "Paper Generator",
+  "papers.generate": "Paper Generator",
+  "papers.export": "Paper Generator",
+  "papers.templates.manage": "Paper Generator",
+  "papers.translations.manage": "Paper Generator",
+  "papers.reports.view": "Paper Generator",
   "settings.view": "System & Settings",
   "settings.manage": "System & Settings",
   "roles.manage": "System & Settings",
 };
 
 export const ALL_PERMISSIONS = Object.values(PERMISSIONS);
+
+// ---------------------------------------------------------------------------
+// Paper Generator permissions (Phase 17)
+// ---------------------------------------------------------------------------
+// The Paper Generator previously borrowed question_banks.view/manage. These
+// codes give the module its own granularity INSIDE the existing permission
+// system (same tables, same middleware, same matrix UI — no new architecture).
+
+/** Read-only paper access: view papers, structure, versions, analysis, print data. */
+export const PAPER_VIEW_PERMISSIONS = [
+  "papers.view",
+  "papers.export",
+  "papers.reports.view",
+];
+
+/** Full paper authoring access (implies the view permissions). */
+export const PAPER_MANAGE_PERMISSIONS = [
+  "papers.manage",
+  "papers.generate",
+  "papers.publish",
+  "papers.templates.manage",
+  "papers.translations.manage",
+  "papers.delete",
+];
+
+/**
+ * Map legacy effective access onto Paper Generator permissions so existing
+ * roles keep exactly the access they had through question_banks.view/manage.
+ * Used by seed.js; migration 014 mirrors the same mapping in SQL for roles
+ * already in the database (including custom roles).
+ */
+export function paperPermissionsForLegacy(questionBankPerms = []) {
+  const has = new Set(questionBankPerms);
+  const out = [];
+  // question_banks.manage implies view in the legacy matrix (every role with
+  // manage also holds view), so it maps to the full paper permission set —
+  // matching migration 014's manage-level grant.
+  if (has.has("question_banks.view") || has.has("question_banks.manage")) {
+    out.push(...PAPER_VIEW_PERMISSIONS);
+  }
+  if (has.has("question_banks.manage")) out.push(...PAPER_MANAGE_PERMISSIONS);
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // User repository
@@ -239,7 +300,7 @@ export async function createRole({ code, name, description }) {
     if (error) throw new Error(`Supabase roles.create: ${error.message}`);
     return data;
   }
-  return { code, name, description: description || null };
+  return fileRepo.createRole({ code, name, description });
 }
 
 export async function deleteRole(code) {
@@ -252,7 +313,7 @@ export async function deleteRole(code) {
     if (error) throw new Error(`Supabase roles.delete: ${error.message}`);
     return true;
   }
-  return true;
+  return fileRepo.deleteRole(code);
 }
 
 export async function listPermissions() {
@@ -689,10 +750,10 @@ const rowToQuestion = (row) => ({
   negative_marks: row.negative_marks,
   time_limit_sec: row.time_limit_sec,
   quality_score: row.quality_score,
-  tags: row.tags ?? [],
   status: row.status,
   sort_order: row.sort_order,
   family_id: row.family_id || null,
+  translation_status: row.translation_status ?? null,
   created_at: row.created_at,
   updated_at: row.updated_at,
 });
@@ -808,16 +869,31 @@ function questionMatchesSearch(row, filters = {}) {
   return hay.includes(needle);
 }
 
+// Cap on rows fetched for in-memory search filtering — bounds memory/latency
+// on very large question banks. Results are identical below the cap; above it,
+// matching rows beyond the cap are not scanned (same search semantics, bounded).
+const MAX_SEARCH_SCAN_ROWS = Number(process.env.QUESTION_SEARCH_SCAN_CAP) || 20000;
+
 export async function listQuestions({ with_usage = false, ...filters } = {}) {
   if (!client) return [];
   const { limit = 50, offset = 0, ...rest } = filters;
+  const hasSearch = Boolean((rest.search ?? rest.q)?.trim());
   let query = client.from("questions").select("*").order("sort_order").order("created_at", { ascending: false });
   query = applyQuestionFilters(query, rest);
+  // Performance: page at the DB level when no in-memory filtering is needed —
+  // previously EVERY matching row (full content JSON) was fetched and sliced
+  // in JS. With a search term, fetch a bounded scan window instead of the
+  // whole bank, then filter/paginate in memory as before.
+  query = hasSearch
+    ? query.range(0, MAX_SEARCH_SCAN_ROWS - 1)
+    : query.range(offset, offset + limit - 1);
   const { data, error } = await query;
   if (error) throw new Error(`Supabase questions.list: ${error.message}`);
 
-  let questions = data.map(rowToQuestion).filter((q) => questionMatchesSearch(q, rest));
-  questions = questions.slice(offset, offset + limit);
+  let questions = data.map(rowToQuestion);
+  if (hasSearch) {
+    questions = questions.filter((q) => questionMatchesSearch(q, rest)).slice(offset, offset + limit);
+  }
   if (with_usage) {
     const ids = questions.map((q) => q.id);
     if (ids.length > 0) {
@@ -843,7 +919,7 @@ export async function countQuestions(filters = {}) {
   let query = client.from("questions").select("id" + (hasSearch ? ", content" : ""), hasSearch ? undefined : { count: "exact", head: true });
   query = applyQuestionFilters(query, filters);
   if (hasSearch) {
-    const { data, error } = await query;
+    const { data, error } = await query.range(0, MAX_SEARCH_SCAN_ROWS - 1);
     if (error) throw new Error(`Supabase questions.count: ${error.message}`);
     return (data || []).filter((r) => questionMatchesSearch(r, filters)).length;
   }
@@ -1432,6 +1508,66 @@ export async function listQuestionVariants(familyId) {
   return variants;
 }
 
+/**
+ * Batch variant loading for one or more families in a constant number of
+ * queries (3 total regardless of family count) instead of the N+1
+ * options/payload round trips per variant. Used by paper loading, set answer
+ * keys and reports so large papers stop multiplying query counts.
+ * Returns a Map<family_id, variants[]>; families with no rows map to [].
+ */
+export async function listQuestionVariantsByFamilies(familyIds) {
+  const ids = [...new Set((familyIds ?? []).filter(Boolean))];
+  const result = new Map(ids.map((id) => [id, []]));
+  if (!client || ids.length === 0) return result;
+
+  const { data, error } = await client.from("questions")
+    .select("*")
+    .in("family_id", ids)
+    .order("created_at", { ascending: true });
+  if (error) throw new Error(`Supabase question_families.variantsBatch: ${error.message}`);
+  const rows = data ?? [];
+  if (rows.length === 0) return result;
+
+  const questionIds = rows.map((r) => r.id);
+
+  // Query 2: all options for every variant, grouped in memory.
+  const optionsByQuestion = new Map();
+  {
+    const { data: optRows, error: optErr } = await client.from("question_options")
+      .select("*")
+      .in("question_id", questionIds)
+      .order("sort_order");
+    if (optErr) throw new Error(`Supabase options.listBatch: ${optErr.message}`);
+    for (const row of optRows ?? []) {
+      const list = optionsByQuestion.get(row.question_id) ?? [];
+      list.push(row);
+      optionsByQuestion.set(row.question_id, list);
+    }
+  }
+
+  // Query 3: all payloads for every variant, grouped in memory.
+  const payloadByQuestion = new Map();
+  {
+    const { data: payRows, error: payErr } = await client.from("question_payloads")
+      .select("*")
+      .in("question_id", questionIds);
+    if (payErr) throw new Error(`Supabase payload.listBatch: ${payErr.message}`);
+    for (const row of payRows ?? []) {
+      payloadByQuestion.set(row.question_id, row);
+    }
+  }
+
+  for (const row of rows) {
+    const q = rowToQuestion(row);
+    result.get(q.family_id)?.push({
+      ...q,
+      options: optionsByQuestion.get(q.id) ?? [],
+      payload: payloadByQuestion.get(q.id)?.payload ?? null,
+    });
+  }
+  return result;
+}
+
 // Link an existing question into a variant family. Creates the family when
 // none exists (or the supplied id is unknown), so all variants share one family.
 export async function linkQuestionToFamily(questionId, familyId) {
@@ -1469,18 +1605,27 @@ const rowToPaper = (row) => ({
   duration_min: row.duration_min,
   total_marks: row.total_marks,
   status: row.status,
+  blueprint: row.blueprint ?? null,
   created_by: row.created_by,
   created_at: row.created_at,
   updated_at: row.updated_at,
+  validated_at: row.validated_at ?? null,
+  published_at: row.published_at ?? null,
+  archived_at: row.archived_at ?? null,
 });
 
 async function listPaperFamilyRows(paperId) {
+  // section_key arrives with migration 008; tolerate its absence pre-migration.
   const { data, error } = await client.from("paper_families")
     .select("*")
     .eq("paper_id", paperId)
     .order("sort_order", { ascending: true });
   if (error) throw new Error(`Supabase paper_families.list: ${error.message}`);
-  return data || [];
+  return (data || []).map((row) => ({
+    ...row,
+    section_key: row.section_key ?? null,
+    locked: row.locked ?? false,
+  }));
 }
 
 export async function listPapers({ status, created_by, limit = 100, offset = 0 } = {}) {
@@ -1497,7 +1642,12 @@ export async function listPapers({ status, created_by, limit = 100, offset = 0 }
     ...rowToPaper(r),
     question_count: r.paper_families?.[0]?.count ?? 0,
   }));
-  const { count, error: countErr } = await client.from("papers").select("id", { count: "exact", head: true });
+  // Total count must honor the same filters as the page query so pagination
+  // totals stay correct when callers filter by status or creator.
+  let countQuery = client.from("papers").select("id", { count: "exact", head: true });
+  if (status) countQuery = countQuery.eq("status", status);
+  if (created_by) countQuery = countQuery.eq("created_by", created_by);
+  const { count, error: countErr } = await countQuery;
   if (countErr) throw new Error(`Supabase papers.count: ${countErr.message}`);
   return { papers, total: count ?? 0 };
 }
@@ -1509,21 +1659,28 @@ async function paperByIdWithFamilies(id) {
   if (error) throw new Error(`Supabase papers.get: ${error.message}`);
   if (!data) return null;
   const rows = await listPaperFamilyRows(id);
-  const families = [];
-  for (const row of rows) {
+  // Performance: one batched fetch for ALL family variants (+options+payloads)
+  // — 4 queries total instead of 2 per family (N+1 on large papers).
+  const variantsByFamily = await listQuestionVariantsByFamilies(
+    rows.map((r) => r.family_id).filter(Boolean)
+  ).catch(() => new Map());
+  const families = rows.map((row) => {
     let primary = null;
     let variants = [];
-    const base = { id: row.id, family_id: row.family_id, sort_order: row.sort_order, marks: row.marks };
-    try {
-      variants = await listQuestionVariants(row.family_id);
-    } catch {
-      variants = [];
-    }
+    const base = {
+      id: row.id,
+      family_id: row.family_id,
+      sort_order: row.sort_order,
+      marks: row.marks,
+      section_key: row.section_key ?? null,
+      locked: row.locked ?? false,
+    };
+    variants = variantsByFamily.get(row.family_id) ?? [];
     if (variants.length) {
       primary = variants.find((v) => v.language_id) || variants[0];
     }
-    families.push({ ...base, primary, variants });
-  }
+    return { ...base, primary, variants };
+  });
   return { paper: rowToPaper(data), families };
 }
 
@@ -1532,40 +1689,127 @@ export async function getPaperById(id) {
   return paperByIdWithFamilies(id);
 }
 
+// --- Blueprint column graceful degradation -------------------------------
+// Migration 008 (papers.blueprint, paper_families.section_key/locked,
+// papers.sets) is applied manually via the Supabase SQL editor. Until it runs,
+// PostgREST rejects unknown columns — so new-column writes fail loudly with a
+// clear operator message, new-column reads return null + migrationRequired,
+// and paper creation silently drops the blueprint instead of breaking CRUD.
+function isMissingBlueprintColumn(error) {
+  if (!error) return false;
+  const msg = String(error.message || error);
+  return error.code === "PGRST204" || /(blueprint|sets|section_key|locked)/i.test(msg) && /(column|schema cache)/i.test(msg);
+}
+
+// Migration 009 (questions.translation_status, papers.translations) degrades
+// independently of 008 so each paste can be applied separately.
+function isMissingTranslationColumn(error) {
+  if (!error) return false;
+  const msg = String(error.message || error);
+  return error.code === "PGRST204" || /translation/i.test(msg) && /(column|schema cache)/i.test(msg);
+}
+
 export async function createPaper({
   title, description, standard_id, subject_id, exam_type_id,
-  duration_min, total_marks, status, created_by, familyIds,
+  duration_min, total_marks, status, created_by, familyIds, blueprint,
 }) {
   if (!client) throw new Error("Supabase not configured");
-  const { data, error } = await client.from("papers")
-    .insert({
-      title,
-      description: description || null,
-      standard_id: standard_id || null,
-      subject_id: subject_id || null,
-      exam_type_id: exam_type_id || null,
-      duration_min: duration_min ?? 120,
-      total_marks: total_marks ?? 0,
-      status: status || "draft",
-      created_by,
-    })
-    .select().single();
+  let data, error;
+  try {
+    ({ data, error } = await client.from("papers")
+      .insert({
+        title,
+        description: description || null,
+        standard_id: standard_id || null,
+        subject_id: subject_id || null,
+        exam_type_id: exam_type_id || null,
+        duration_min: duration_min ?? 120,
+        total_marks: total_marks ?? 0,
+        status: status || "draft",
+        blueprint: blueprint ?? null,
+        created_by,
+      })
+      .select().single());
+  } catch (err) {
+    // Older SDK surface: fallback insert without the blueprint column.
+    if (isMissingBlueprintColumn(err)) {
+      console.warn("papers.blueprint column missing — create paper without blueprint (apply migrations/008_paper_blueprints.sql)");
+      ({ data, error } = await client.from("papers")
+        .insert({
+          title,
+          description: description || null,
+          standard_id: standard_id || null,
+          subject_id: subject_id || null,
+          exam_type_id: exam_type_id || null,
+          duration_min: duration_min ?? 120,
+          total_marks: total_marks ?? 0,
+          status: status || "draft",
+          created_by,
+        })
+        .select().single());
+    } else {
+      throw err;
+    }
+  }
+  if (error && isMissingBlueprintColumn(error)) {
+    console.warn("papers.blueprint column missing — create paper without blueprint (apply migrations/008_paper_blueprints.sql)");
+    ({ data, error } = await client.from("papers")
+      .insert({
+        title,
+        description: description || null,
+        standard_id: standard_id || null,
+        subject_id: subject_id || null,
+        exam_type_id: exam_type_id || null,
+        duration_min: duration_min ?? 120,
+        total_marks: total_marks ?? 0,
+        status: status || "draft",
+        created_by,
+      })
+      .select().single());
+  }
   if (error) throw new Error(`Supabase papers.create: ${error.message}`);
   await replacePaperFamilies(data.id, familyIds ?? []);
   return paperByIdWithFamilies(data.id);
 }
 
+/**
+ * Replace the ordered family list of a paper. Accepts either:
+ *   - string[] of family ids (marks 0, no section, unlocked — original behavior), or
+ *   - { familyId, marks?, sectionKey?, locked? }[] entries (Paper Generator phases 3–5).
+ * section_key/locked are dropped silently when migration 008 has not been
+ * applied yet, so paper editing keeps working before the columns exist.
+ */
 export async function replacePaperFamilies(paperId, familyIds) {
   if (!client) return;
   await client.from("paper_families").delete().eq("paper_id", paperId);
   if (!familyIds.length) return;
-  const rows = familyIds.map((familyId, i) => ({
-    paper_id: paperId,
-    family_id: familyId,
-    sort_order: i,
-    marks: 0,
-  }));
+  const rows = familyIds.map((entry, i) => {
+    const familyId = typeof entry === "string" ? entry : entry?.familyId;
+    const isObj = typeof entry === "object" && entry;
+    const marks = isObj ? Number(entry.marks) || 0 : 0;
+    const sectionKey =
+      isObj && typeof entry.sectionKey === "string" && entry.sectionKey
+        ? entry.sectionKey
+        : null;
+    const locked = Boolean(isObj && entry.locked);
+    const row = {
+      paper_id: paperId,
+      family_id: familyId,
+      sort_order: i,
+      marks,
+    };
+    if (sectionKey) row.section_key = sectionKey;
+    if (locked) row.locked = true;
+    return row;
+  });
   const { error } = await client.from("paper_families").insert(rows);
+  if (error && isMissingBlueprintColumn(error) && rows.some((r) => "section_key" in r || "locked" in r)) {
+    // Pre-migration: retry without section/lock assignments (marks/order kept).
+    const retryRows = rows.map(({ section_key, locked, ...rest }) => rest);
+    const { error: retryError } = await client.from("paper_families").insert(retryRows);
+    if (retryError) throw new Error(`Supabase paper_families.replace: ${retryError.message}`);
+    return;
+  }
   if (error) throw new Error(`Supabase paper_families.replace: ${error.message}`);
 }
 
@@ -1577,12 +1821,24 @@ export async function updatePaper(id, patch, familyIds) {
     standard_id: "standard_id", subject_id: "subject_id",
     exam_type_id: "exam_type_id", duration_min: "duration_min",
     total_marks: "total_marks", status: "status",
+    blueprint: "blueprint",
+    translations: "translations",
   };
   for (const [key, col] of Object.entries(fieldMap)) {
     if (patch[key] !== undefined) dbPatch[col] = patch[key];
   }
   if (Object.keys(dbPatch).length) {
     const { error } = await client.from("papers").update(dbPatch).eq("id", id);
+    if (error && isMissingBlueprintColumn(error) && dbPatch.blueprint !== undefined) {
+      throw new Error(
+        "Blueprint storage is not available: apply backend/migrations/008_paper_blueprints.sql in the Supabase SQL editor."
+      );
+    }
+    if (error && isMissingTranslationColumn(error) && dbPatch.translations !== undefined) {
+      throw new Error(
+        "Translation storage is not available: apply backend/migrations/009_translation_states.sql in the Supabase SQL editor."
+      );
+    }
     if (error) throw new Error(`Supabase papers.update: ${error.message}`);
   }
   if (familyIds !== undefined) {
@@ -1596,6 +1852,120 @@ export async function deletePaper(id) {
   const { error } = await client.from("papers").delete().eq("id", id);
   if (error) throw new Error(`Supabase papers.delete: ${error.message}`);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Paper Lifecycle Management (Paper Generator Phase 16)
+// ---------------------------------------------------------------------------
+
+// Migration 013 adds validated_at/published_at/archived_at. Before the columns
+// exist these helpers degrade: status updates still work, timestamps are
+// silently skipped.
+function isMissingLifecycleColumn(error) {
+  if (!error) return false;
+  const msg = String(error.message || error);
+  return (
+    error.code === "PGRST204" ||
+    (/(validated_at|published_at|archived_at)/i.test(msg) && /(column|schema cache)/i.test(msg))
+  );
+}
+
+/**
+ * Transition a paper's status and record the matching lifecycle timestamp.
+ * `clear: [...]` nulls out the listed lifecycle columns (used when un-archiving
+ * so the archived_at stamp is not misleading). Returns the updated paper (or
+ * null on pre-migration degrade — the status update itself still succeeded).
+ */
+export async function transitionPaperStatus(paperId, status, { timestamp = "now()", clear = [] } = {}) {
+  if (!client) return null;
+  const statusPatch = { status };
+  if (status === "validated") statusPatch.validated_at = timestamp;
+  else if (status === "published") statusPatch.published_at = timestamp;
+  else if (status === "archived") statusPatch.archived_at = timestamp;
+  for (const key of clear) {
+    if (["validated_at", "published_at", "archived_at"].includes(key)) statusPatch[key] = null;
+  }
+
+  const { error } = await client.from("papers").update(statusPatch).eq("id", paperId);
+  if (error && isMissingLifecycleColumn(error)) {
+    const { error: fallbackErr } = await client.from("papers").update({ status }).eq("id", paperId);
+    if (fallbackErr) throw new Error(`Supabase papers.lifecycle.status: ${fallbackErr.message}`);
+    return null;
+  }
+  if (error) throw new Error(`Supabase papers.lifecycle: ${error.message}`);
+  return paperByIdWithFamilies(paperId);
+}
+
+/**
+ * Create a duplicate of an existing paper (families, blueprint, translations)
+ * as a new draft. Sets are NOT copied — the admin regenerates them.
+ */
+export async function duplicatePaper(sourcePaperId, createdBy) {
+  if (!client) throw new Error("Supabase not configured");
+
+  const source = await paperByIdWithFamilies(sourcePaperId);
+  if (!source) return null;
+  const bp = await getPaperBlueprint(sourcePaperId).catch(() => null);
+  const setsData = await getPaperSets(sourcePaperId).catch(() => null);
+
+  const patch = {
+    title: `${source.paper.title} (copy)`,
+    description: source.paper.description,
+    standard_id: source.paper.standard_id,
+    subject_id: source.paper.subject_id,
+    exam_type_id: source.paper.exam_type_id,
+    duration_min: source.paper.duration_min,
+    total_marks: source.paper.total_marks,
+    status: "draft",
+    blueprint: bp?.blueprint ?? null,
+    created_by: createdBy,
+  };
+
+  let insertData, insertErr;
+  try {
+    ({ data: insertData, error: insertErr } = await client.from("papers").insert(patch).select().single());
+  } catch (err) {
+    if (isMissingBlueprintColumn(err)) {
+      ({ data: insertData, error: insertErr } = await client.from("papers")
+        .insert({ ...patch, blueprint: undefined })
+        .select().single());
+    } else {
+      throw err;
+    }
+  }
+  if (insertErr && isMissingBlueprintColumn(insertErr)) {
+    ({ data: insertData, error: insertErr } = await client.from("papers")
+      .insert({ ...patch, blueprint: undefined })
+      .select().single());
+  }
+  if (insertErr) throw new Error(`Supabase papers.duplicate.create: ${insertErr.message}`);
+
+  const newId = insertData.id;
+
+  const familyRows = source.families.map((f) => ({
+    paper_id: newId,
+    family_id: f.family_id,
+    sort_order: Number(f.sort_order) || 0,
+    marks: Number(f.marks) || 0,
+    ...(f.section_key ? { section_key: f.section_key } : {}),
+    ...(f.locked ? { locked: true } : {}),
+  }));
+  if (familyRows.length > 0) {
+    const { error: famErr } = await client.from("paper_families").insert(familyRows);
+    if (famErr && isMissingBlueprintColumn(famErr)) {
+      const leanRows = familyRows.map(({ section_key, locked, ...rest }) => rest);
+      const { error: leanErr } = await client.from("paper_families").insert(leanRows);
+      if (leanErr) throw new Error(`Supabase papers.duplicate.families: ${leanErr.message}`);
+    } else if (famErr) {
+      throw new Error(`Supabase papers.duplicate.families: ${famErr.message}`);
+    }
+  }
+
+  if (setsData?.translations) {
+    await updatePaperTranslations(newId, setsData.translations).catch(() => {});
+  }
+
+  return paperByIdWithFamilies(newId);
 }
 
 export async function getPaperLanguages(id) {
@@ -1639,4 +2009,666 @@ export async function getPaperInLanguage(id, languageId) {
     }
   }
   return { paper: loaded.paper, questions, missing_families: [...missingLangs] };
+}
+
+// ---------------------------------------------------------------------------
+// Paper blueprint (Paper Generator Phase 2)
+// ---------------------------------------------------------------------------
+
+/** Single-purpose read of just the paper + its blueprint (no family joins). */
+export async function getPaperBlueprint(id) {
+  if (!client) return null;
+  let { data, error } = await client.from("papers")
+    .select("id, title, description, standard_id, subject_id, exam_type_id, duration_min, total_marks, status, blueprint, created_by, created_at, updated_at")
+    .eq("id", id).maybeSingle();
+  if (error && isMissingBlueprintColumn(error)) {
+    // Migration 008 not applied yet — degrade to blueprint-less read.
+    ({ data, error } = await client.from("papers")
+      .select("id, title, description, standard_id, subject_id, exam_type_id, duration_min, total_marks, status, created_by, created_at, updated_at")
+      .eq("id", id).maybeSingle());
+    if (error) throw new Error(`Supabase papers.blueprint.get: ${error.message}`);
+    if (!data) return null;
+    return { paper: rowToPaper(data), blueprint: null, migrationRequired: true };
+  }
+  if (error) throw new Error(`Supabase papers.blueprint.get: ${error.message}`);
+  if (!data) return null;
+  return { paper: rowToPaper(data), blueprint: data.blueprint ?? null, migrationRequired: false };
+}
+
+// ---------------------------------------------------------------------------
+// Paper sets & randomization (Paper Generator Phase 7)
+// ---------------------------------------------------------------------------
+
+/** Read just the paper + its sets document (no family joins). */
+export async function getPaperSets(id) {
+  if (!client) return null;
+  let { data, error } = await client.from("papers")
+    .select("id, title, status, standard_id, subject_id, exam_type_id, duration_min, total_marks, sets, translations, created_by, created_at, updated_at")
+    .eq("id", id).maybeSingle();
+  if (error && isMissingBlueprintColumn(error)) {
+    // The sets column ships with the same migration 008 paste; degrade the
+    // read so the Sets page still renders with a migration hint.
+    ({ data, error } = await client.from("papers")
+      .select("id, title, status, standard_id, subject_id, exam_type_id, duration_min, total_marks, created_by, created_at, updated_at")
+      .eq("id", id).maybeSingle());
+    if (error) throw new Error(`Supabase papers.sets.get: ${error.message}`);
+    if (!data) return null;
+    return { paper: rowToPaper(data), sets: null, migrationRequired: true };
+  }
+  if (error) throw new Error(`Supabase papers.sets.get: ${error.message}`);
+  if (!data) return null;
+  return { paper: rowToPaper(data), sets: data.sets ?? null, translations: data.translations ?? null, migrationRequired: false };
+}
+
+/**
+ * Persist the sets document. `null` clears all sets. Degrades gracefully
+ * before migration 008 by surfacing an operator-facing error (the sets
+ * feature has no meaningful fallback without storage).
+ */
+export async function updatePaperSets(id, sets) {
+  if (!client) throw new Error("Supabase not configured");
+  const { error } = await client.from("papers")
+    .update({ sets: sets ?? null })
+    .eq("id", id);
+  if (error && isMissingBlueprintColumn(error)) {
+    throw new Error(
+      "Sets storage is not available: apply backend/migrations/008_paper_blueprints.sql in the Supabase SQL editor."
+    );
+  }
+  if (error) throw new Error(`Supabase papers.sets.update: ${error.message}`);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Multilingual Paper Engine (Paper Generator Phase 8)
+// Logical question identity lives in question_families; each language variant
+// is a normal questions row with its own language_id. No duplicate questions
+// are created — a "translation" is just another variant of the same family.
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-language readiness doc for a paper. `null` clears it. Degrades with a
+ * clear operator error before migration 009 (storage has no fallback).
+ */
+export async function updatePaperTranslations(id, translations) {
+  if (!client) throw new Error("Supabase not configured");
+  const { error } = await client.from("papers")
+    .update({ translations: translations ?? null })
+    .eq("id", id);
+  if (error && isMissingTranslationColumn(error)) {
+    throw new Error(
+      "Translation storage is not available: apply backend/migrations/009_translation_states.sql in the Supabase SQL editor."
+    );
+  }
+  if (error) throw new Error(`Supabase papers.translations.update: ${error.message}`);
+  return true;
+}
+
+/**
+ * Language-aware paper rendering. Variant choice per family, in priority
+ * order: exact language → approved/reviewed variants of other languages
+ * (substitution, flagged) → base-language variant (substitution, flagged) →
+ * nothing (reported as missing). Never invents or renames questions; the
+ * caller decides how to treat substituted/missing entries.
+ *
+ * mode "strict": substituted families are moved to `unresolved` — the paper
+ * is NOT silently rendered with unrelated-language content. mode "substitute"
+ * preserves the legacy print behavior (render best-available, flagged).
+ */
+export async function getPaperInLanguageStrict(id, languageId, { mode = "substitute" } = {}) {
+  if (!client) return null;
+  const loaded = await paperByIdWithFamilies(id);
+  if (!loaded) return null;
+
+  const order = { approved: 0, reviewed: 1, translated: 2, draft: 3 };
+  const stateOf = (v) => v?.translation_status ?? "draft";
+
+  // Per-language section instructions from the paper's translations doc.
+  let sections = {};
+  try {
+    const stored = await getPaperSets(id); // returns translations too (cheap single-row read)
+    sections = stored?.translations?.languages?.[languageId]?.sections ?? {};
+  } catch {
+    sections = {};
+  }
+
+  const questions = [];
+  const unresolved = [];
+  for (const fam of loaded.families) {
+    const variants = fam.variants || [];
+    const exact = variants.filter((v) => v.language_id === languageId);
+    let variant = null;
+    let substituted = false;
+
+    if (exact.length > 0) {
+      // Prefer the highest workflow state, then the newest row.
+      variant = [...exact].sort(
+        (a, b) => (order[stateOf(a)] ?? 3) - (order[stateOf(b)] ?? 3) ||
+          String(b.created_at ?? "").localeCompare(String(a.created_at ?? ""))
+      )[0];
+    } else if (variants.length > 0) {
+      substituted = true;
+      if (mode === "strict") {
+        unresolved.push({
+          family_id: fam.family_id,
+          sort_order: fam.sort_order,
+          reason: "translation_missing",
+          available_languages: [...new Set(variants.map((v) => v.language_id).filter(Boolean))],
+        });
+        continue;
+      }
+      // Legacy substitution: best non-exact variant, never across families.
+      variant = [...variants].sort(
+        (a, b) => (order[stateOf(a)] ?? 3) - (order[stateOf(b)] ?? 3)
+      )[0];
+    } else {
+      unresolved.push({
+        family_id: fam.family_id,
+        sort_order: fam.sort_order,
+        reason: "no_variants",
+        available_languages: [],
+      });
+      continue;
+    }
+
+    questions.push({
+      id: fam.id,
+      family_id: fam.family_id,
+      sort_order: fam.sort_order,
+      marks: fam.marks || variant.marks,
+      resolved_language_id: variant.language_id,
+      substituted,
+      translation_status: stateOf(variant),
+      section_key: fam.section_key ?? null,
+      question: variant,
+    });
+  }
+
+  return {
+    paper: loaded.paper,
+    questions,
+    unresolved,
+    requested_language_id: languageId,
+    mode,
+    complete: unresolved.length === 0 && questions.every((q) => !q.substituted),
+  };
+}
+
+/** Set the workflow state on one question variant (language version). */
+export async function updateQuestionTranslationStatus(id, status) {
+  if (!client) throw new Error("Supabase not configured");
+  const { data, error } = await client.from("questions")
+    .update({ translation_status: status })
+    .eq("id", id)
+    .select()
+    .maybeSingle();
+  if (error && isMissingTranslationColumn(error)) {
+    throw new Error(
+      "Translation state storage is not available: apply backend/migrations/009_translation_states.sql in the Supabase SQL editor."
+    );
+  }
+  if (error) throw new Error(`Supabase questions.translation_status.update: ${error.message}`);
+  return data ? rowToQuestion(data) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Separate Language Paper Generation (Paper Generator Phase 9)
+// Storage layer for derived per-language paper artifacts. The generation
+// logic itself lives in paperService.buildLanguagePaperSnapshot (pure); these
+// functions only persist/read the snapshots. Migration 010 degrades
+// independently of 008/009 so each paste can be applied separately.
+// ---------------------------------------------------------------------------
+
+function isMissingLanguagePaperTable(error) {
+  if (!error) return false;
+  const msg = String(error.message || error);
+  return (
+    error.code === "PGRST204" ||
+    (/paper_languages/i.test(msg) && /(relation|table|does not exist|schema cache)/i.test(msg))
+  );
+}
+
+function languagePaperRow(row) {
+  return {
+    id: row.id,
+    master_paper_id: row.master_paper_id,
+    language_id: row.language_id,
+    version: row.version,
+    set_key: row.set_key ?? null,
+    status: row.status,
+    generated_by: row.generated_by ?? null,
+    generated_at: row.generated_at,
+    updated_at: row.updated_at,
+    snapshot: row.snapshot ?? null,
+  };
+}
+
+/** All generated language paper versions of one master paper, newest first. */
+export async function listLanguagePapers(masterPaperId) {
+  if (!client) return [];
+  const { data, error } = await client.from("paper_languages")
+    .select("*")
+    .eq("master_paper_id", masterPaperId)
+    .order("language_id", { ascending: true })
+    .order("version", { ascending: false });
+  if (error && isMissingLanguagePaperTable(error)) return [];
+  if (error) throw new Error(`Supabase paper_languages.list: ${error.message}`);
+  return (data || []).map(languagePaperRow);
+}
+
+/** Insert one generated language paper. Returns the stored row. */
+export async function createLanguagePaper({
+  master_paper_id,
+  language_id,
+  version,
+  set_key,
+  status,
+  generated_by,
+  snapshot,
+}) {
+  if (!client) throw new Error("Supabase not configured");
+  const { data, error } = await client.from("paper_languages")
+    .insert({
+      master_paper_id,
+      language_id,
+      version: version ?? 1,
+      set_key: set_key ?? null,
+      status: status || "generated",
+      generated_by: generated_by || null,
+      snapshot: snapshot ?? null,
+    })
+    .select()
+    .single();
+  if (error && isMissingLanguagePaperTable(error)) {
+    throw new Error(
+      "Language paper storage is not available: apply backend/migrations/010_language_papers.sql in the Supabase SQL editor."
+    );
+  }
+  if (error) throw new Error(`Supabase paper_languages.create: ${error.message}`);
+  return languagePaperRow(data);
+}
+
+/** One stored language paper artifact (snapshot + metadata, no content joins). */
+export async function getLanguagePaperData(masterPaperId, version) {
+  if (!client) return null;
+  const { data, error } = await client.from("paper_languages")
+    .select("*")
+    .eq("master_paper_id", masterPaperId)
+    .eq("version", version)
+    .maybeSingle();
+  if (error && isMissingLanguagePaperTable(error)) {
+    throw new Error(
+      "Language paper storage is not available: apply backend/migrations/010_language_papers.sql in the Supabase SQL editor."
+    );
+  }
+  if (error) throw new Error(`Supabase paper_languages.get: ${error.message}`);
+  return data ? languagePaperRow(data) : null;
+}
+
+/** Update status (draft | generated | approved | archived). */
+export async function updateLanguagePaperStatus(masterPaperId, version, status) {
+  if (!client) throw new Error("Supabase not configured");
+  const { data, error } = await client.from("paper_languages")
+    .update({ status })
+    .eq("master_paper_id", masterPaperId)
+    .eq("version", version)
+    .select()
+    .maybeSingle();
+  if (error && isMissingLanguagePaperTable(error)) {
+    throw new Error(
+      "Language paper storage is not available: apply backend/migrations/010_language_papers.sql in the Supabase SQL editor."
+    );
+  }
+  if (error) throw new Error(`Supabase paper_languages.status: ${error.message}`);
+  return data ? languagePaperRow(data) : null;
+}
+
+/** Delete one language paper version. */
+export async function deleteLanguagePaper(masterPaperId, version) {
+  if (!client) throw new Error("Supabase not configured");
+  const { data, error } = await client.from("paper_languages")
+    .delete()
+    .eq("master_paper_id", masterPaperId)
+    .eq("version", version)
+    .select()
+    .maybeSingle();
+  if (error && isMissingLanguagePaperTable(error)) {
+    throw new Error(
+      "Language paper storage is not available: apply backend/migrations/010_language_papers.sql in the Supabase SQL editor."
+    );
+  }
+  if (error) throw new Error(`Supabase paper_languages.delete: ${error.message}`);
+  return data ? languagePaperRow(data) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Paper template repository (Paper Generator Phase 11)
+// ---------------------------------------------------------------------------
+function isMissingPaperTemplatesTable(error) {
+  if (!error) return false;
+  const msg = String(error.message || error);
+  return (
+    error.code === "PGRST204" ||
+    (/paper_templates/i.test(msg) && /(relation|table|does not exist|schema cache)/i.test(msg))
+  );
+}
+
+function paperTemplateRow(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description ?? null,
+    kind: row.kind,
+    config: row.config ?? {},
+    is_default: Boolean(row.is_default),
+    created_by: row.created_by ?? null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+const PAPER_TEMPLATES_MIGRATION_HINT =
+  "Paper template storage is not available: apply backend/migrations/011_paper_templates.sql in the Supabase SQL editor.";
+
+/** All saved paper templates, newest first. Optional kind filter. */
+export async function listPaperTemplates(kind) {
+  if (!client) return [];
+  let query = client.from("paper_templates").select("*").order("created_at", { ascending: false });
+  if (kind) query = query.eq("kind", kind);
+  const { data, error } = await query;
+  if (error && isMissingPaperTemplatesTable(error)) return [];
+  if (error) throw new Error(`Supabase paper_templates.list: ${error.message}`);
+  return (data || []).map(paperTemplateRow);
+}
+
+/** The flagged default template for a kind (null when none is flagged). */
+export async function getDefaultPaperTemplate(kind) {
+  if (!client) return null;
+  const { data, error } = await client.from("paper_templates")
+    .select("*")
+    .eq("kind", kind)
+    .eq("is_default", true)
+    .maybeSingle();
+  if (error && isMissingPaperTemplatesTable(error)) return null;
+  if (error) throw new Error(`Supabase paper_templates.default: ${error.message}`);
+  return data ? paperTemplateRow(data) : null;
+}
+
+/** One saved template by id. */
+export async function getPaperTemplate(id) {
+  if (!client) return null;
+  const { data, error } = await client.from("paper_templates")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  if (error && isMissingPaperTemplatesTable(error)) return null;
+  if (error) throw new Error(`Supabase paper_templates.get: ${error.message}`);
+  return data ? paperTemplateRow(data) : null;
+}
+
+/** Insert one saved template. Returns the stored row. */
+export async function createPaperTemplate({ name, description, kind, config, is_default, created_by }) {
+  if (!client) throw new Error("Supabase not configured");
+  if (is_default) {
+    await client.from("paper_templates")
+      .update({ is_default: false })
+      .eq("kind", kind ?? "single");
+  }
+  const { data, error } = await client.from("paper_templates")
+    .insert({
+      name,
+      description: description ?? null,
+      kind: kind || "single",
+      config: config ?? {},
+      is_default: Boolean(is_default),
+      created_by: created_by || null,
+    })
+    .select()
+    .single();
+  if (error && isMissingPaperTemplatesTable(error)) {
+    throw new Error(PAPER_TEMPLATES_MIGRATION_HINT);
+  }
+  if (error) throw new Error(`Supabase paper_templates.create: ${error.message}`);
+  return paperTemplateRow(data);
+}
+
+/** Patch one saved template (name/description/kind/config/is_default). */
+export async function updatePaperTemplate(id, patch) {
+  if (!client) throw new Error("Supabase not configured");
+  if (patch.kind && patch.is_default === true) {
+    await client.from("paper_templates")
+      .update({ is_default: false })
+      .eq("kind", patch.kind)
+      .neq("id", id);
+  }
+  const fields = {};
+  if (patch.name !== undefined) fields.name = patch.name;
+  if (patch.description !== undefined) fields.description = patch.description;
+  if (patch.kind !== undefined) fields.kind = patch.kind;
+  if (patch.config !== undefined) fields.config = patch.config;
+  if (patch.is_default !== undefined) fields.is_default = Boolean(patch.is_default);
+  const { data, error } = await client.from("paper_templates")
+    .update(fields)
+    .eq("id", id)
+    .select()
+    .maybeSingle();
+  if (error && isMissingPaperTemplatesTable(error)) {
+    throw new Error(PAPER_TEMPLATES_MIGRATION_HINT);
+  }
+  if (error) throw new Error(`Supabase paper_templates.update: ${error.message}`);
+  return data ? paperTemplateRow(data) : null;
+}
+
+/** Delete one saved template. Returns the deleted row (null when missing). */
+export async function deletePaperTemplate(id) {
+  if (!client) throw new Error("Supabase not configured");
+  const { data, error } = await client.from("paper_templates")
+    .delete()
+    .eq("id", id)
+    .select()
+    .maybeSingle();
+  if (error && isMissingPaperTemplatesTable(error)) {
+    throw new Error(PAPER_TEMPLATES_MIGRATION_HINT);
+  }
+  if (error) throw new Error(`Supabase paper_templates.delete: ${error.message}`);
+  return data ? paperTemplateRow(data) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Paper Versioning & History (Paper Generator Phase 15)
+// Insert-only version timeline: each row is an immutable snapshot of the paper
+// state (buildPaperSnapshot in paperService.js). Writes DEGRADE gracefully
+// before migration 012 is applied so publish/create are never broken by a
+// missing table; reads report migrationRequired like the sets/blueprint reads.
+// ---------------------------------------------------------------------------
+
+function isMissingPaperVersionsTable(error) {
+  if (!error) return false;
+  const msg = String(error.message || error);
+  return (
+    error.code === "PGRST204" ||
+    (/paper_versions/i.test(msg) && /(relation|table|does not exist|schema cache)/i.test(msg))
+  );
+}
+
+const PAPER_VERSIONS_HINT =
+  "Paper versioning is not available: apply backend/migrations/012_paper_versioning.sql in the Supabase SQL editor.";
+
+function paperVersionRow(row, { withSnapshot = false } = {}) {
+  const base = {
+    id: row.id,
+    paper_id: row.paper_id,
+    version: row.version,
+    reason: row.reason,
+    note: row.note ?? null,
+    summary: row.summary ?? null,
+    changes: row.changes ?? {},
+    parent_version: row.parent_version ?? null,
+    created_by: row.created_by ?? null,
+    created_at: row.created_at,
+  };
+  if (withSnapshot) base.snapshot = row.snapshot ?? null;
+  return base;
+}
+
+const VERSION_LIST_COLUMNS =
+  "id, paper_id, version, reason, note, summary, changes, parent_version, created_by, created_at";
+
+/** All saved versions of one paper (metadata only, newest last for ordering). */
+export async function listPaperVersions(paperId) {
+  if (!client) return { versions: [], currentVersion: 0, createdVersion: 0, migrationRequired: false };
+  const { data, error } = await client.from("paper_versions")
+    .select(VERSION_LIST_COLUMNS)
+    .eq("paper_id", paperId)
+    .order("version", { ascending: false });
+  if (error && isMissingPaperVersionsTable(error)) {
+    return { versions: [], currentVersion: 0, createdVersion: 0, migrationRequired: true };
+  }
+  if (error) throw new Error(`Supabase paper_versions.list: ${error.message}`);
+  const versions = (data || []).map((r) => paperVersionRow(r));
+  const numbers = versions.map((v) => v.version);
+  return {
+    versions,
+    currentVersion: numbers.length ? Math.max(...numbers) : 0,
+    createdVersion: numbers.length ? Math.min(...numbers) : 0,
+    migrationRequired: false,
+  };
+}
+
+/** The newest saved version (full row incl. snapshot) or null. */
+export async function getLatestPaperVersion(paperId) {
+  if (!client) return null;
+  const { data, error } = await client.from("paper_versions")
+    .select("*")
+    .eq("paper_id", paperId)
+    .order("version", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error && isMissingPaperVersionsTable(error)) return null;
+  if (error) throw new Error(`Supabase paper_versions.latest: ${error.message}`);
+  return data ? paperVersionRow(data, { withSnapshot: true }) : null;
+}
+
+/** One saved version (full row incl. snapshot) by version number. */
+export async function getPaperVersion(paperId, version) {
+  if (!client) return null;
+  const { data, error } = await client.from("paper_versions")
+    .select("*")
+    .eq("paper_id", paperId)
+    .eq("version", version)
+    .maybeSingle();
+  if (error && isMissingPaperVersionsTable(error)) {
+    throw new Error(PAPER_VERSIONS_HINT);
+  }
+  if (error) throw new Error(`Supabase paper_versions.get: ${error.message}`);
+  return data ? paperVersionRow(data, { withSnapshot: true }) : null;
+}
+
+/**
+ * Insert one immutable version row. Best-effort: returns null (and warns)
+ * before migration 012 so capturing never breaks the primary operation
+ * (create/publish) that triggered it.
+ */
+export async function insertPaperVersion({
+  paper_id,
+  version,
+  reason = "manual",
+  note = null,
+  summary = null,
+  changes = {},
+  snapshot,
+  created_by = null,
+  parent_version = null,
+}) {
+  if (!client) return null;
+  const { data, error } = await client.from("paper_versions")
+    .insert({
+      paper_id,
+      version,
+      reason,
+      note: note ?? null,
+      summary: summary ?? null,
+      changes: changes ?? {},
+      snapshot,
+      created_by: created_by || null,
+      parent_version: parent_version ?? null,
+    })
+    .select()
+    .single();
+  if (error && isMissingPaperVersionsTable(error)) {
+    console.warn(PAPER_VERSIONS_HINT);
+    return null;
+  }
+  if (error) throw new Error(`Supabase paper_versions.create: ${error.message}`);
+  return paperVersionRow(data, { withSnapshot: true });
+}
+
+/**
+ * Re-materialise a version snapshot onto the live paper row (safe restore).
+ * Writes the core paper fields as a DRAFT (the admin re-publishes after
+ * reviewing), plus blueprint/sets/translations when their columns exist, and
+ * rebuilds the ordered family list from the snapshot. Families whose question
+ * family has since been deleted are skipped (FK safety) and counted.
+ */
+export async function restorePaperFromSnapshot(paperId, snapshot) {
+  if (!client) throw new Error("Supabase not configured");
+  const fam = Array.isArray(snapshot?.families) ? snapshot.families : [];
+  const corePatch = {
+    title: snapshot?.paper?.title ?? "Untitled paper",
+    description: snapshot?.paper?.description ?? null,
+    standard_id: snapshot?.paper?.standard_id ?? null,
+    subject_id: snapshot?.paper?.subject_id ?? null,
+    exam_type_id: snapshot?.paper?.exam_type_id ?? null,
+    duration_min: Number(snapshot?.paper?.duration_min) || 120,
+    total_marks: Number(snapshot?.paper?.total_marks) || 0,
+    status: "draft",
+  };
+
+  const patchWith = async (extra) => {
+    const merged = extra
+      ? { ...corePatch, blueprint: extra.blueprint, sets: extra.sets, translations: extra.translations }
+      : corePatch;
+    const { error } = await client.from("papers").update(merged).eq("id", paperId);
+    return error;
+  };
+
+  let err = await patchWith({ blueprint: snapshot?.blueprint ?? null, sets: snapshot?.sets ?? null, translations: snapshot?.translations ?? null });
+  if (err) {
+    if (isMissingBlueprintColumn(err) && isMissingTranslationColumn(err)) {
+      err = await patchWith(null);
+    } else if (isMissingBlueprintColumn(err)) {
+      err = await patchWith({ blueprint: undefined, sets: undefined, translations: snapshot?.translations ?? null });
+    } else if (isMissingTranslationColumn(err)) {
+      err = await patchWith({ translations: undefined });
+    }
+  }
+  if (err) throw new Error(`Supabase papers.restore.update: ${err.message}`);
+
+  // Only re-link families that still exist (question_families rows cascade away
+  // with paper closing, so a snapshot can reference deleted families).
+  const ids = fam.map((f) => f.family_id).filter(Boolean);
+  const existing = new Set();
+  if (ids.length > 0 && client) {
+    const { data, error: listErr } = await client.from("question_families").select("id").in("id", ids);
+    if (listErr) throw new Error(`Supabase restore.families.check: ${listErr.message}`);
+    for (const r of data || []) existing.add(r.id);
+  }
+  let skipped = 0;
+  const entries = [];
+  for (const f of fam) {
+    if (!f?.family_id) continue;
+    if (!existing.has(f.family_id)) {
+      skipped += 1;
+      continue;
+    }
+    entries.push({
+      familyId: f.family_id,
+      marks: Number(f.marks) || 0,
+      sectionKey: f.section_key || null,
+      locked: Boolean(f.locked),
+    });
+  }
+  await replacePaperFamilies(paperId, entries);
+  const paper = await paperByIdWithFamilies(paperId);
+  return { paper, skipped };
 }

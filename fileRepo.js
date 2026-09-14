@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import path from "node:path";
 import bcrypt from "bcryptjs";
 import { config } from "./config.js";
 
@@ -20,16 +21,51 @@ const PERMISSIONS = [
   { code: "roles.manage", label: "Manage roles", description: "View and edit role permissions" },
   { code: "question_banks.view", label: "View question banks", description: "View question bank contents" },
   { code: "question_banks.manage", label: "Manage question banks", description: "Create and edit question banks" },
+  // Paper Generator (Phase 17) — same codes as supabase.js PERMISSIONS.
+  { code: "papers.view", label: "View papers", description: "View papers, structure, versions, analysis and print data in the Paper Generator" },
+  { code: "papers.manage", label: "Manage papers", description: "Create, edit, duplicate, validate, archive and restore papers" },
+  { code: "papers.delete", label: "Delete papers", description: "Delete papers that are not published" },
+  { code: "papers.publish", label: "Publish papers", description: "Validate and publish papers" },
+  { code: "papers.generate", label: "Generate papers", description: "Generate paper questions from blueprints and randomization sets" },
+  { code: "papers.export", label: "Export paper PDFs", description: "Export papers as PDF files" },
+  { code: "papers.templates.manage", label: "Manage paper templates", description: "Create, edit and delete saved paper templates" },
+  { code: "papers.translations.manage", label: "Manage paper translations", description: "Manage translation readiness and generate language papers" },
+  { code: "papers.reports.view", label: "View paper reports", description: "View paper answer keys and solutions reports" },
   { code: "settings.view", label: "View settings", description: "View platform settings" },
 ];
+
+const ROLES_FILE = config.rolesFile ?? "data/roles.json";
+
+function loadRoles() {
+  try {
+    const raw = readFileSync(ROLES_FILE, "utf-8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed.roles) ? parsed.roles : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveRoles(roles) {
+  const dir = path.dirname(ROLES_FILE);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(ROLES_FILE, JSON.stringify({ version: 1, roles }, null, 2), "utf-8");
+}
 
 const ROLE_PERMISSIONS = {
   super_admin: [
     "users.view", "users.manage", "roles.manage",
     "question_banks.view", "question_banks.manage", "settings.view",
   ],
-  teacher: ["question_banks.view", "question_banks.manage"],
-  student: ["question_banks.view"],
+  // Paper Generator codes mirror migration 014's mapping of the legacy
+  // question_banks access so fallback behavior is unchanged.
+  teacher: [
+    "question_banks.view", "question_banks.manage",
+    "papers.view", "papers.manage", "papers.delete", "papers.publish",
+    "papers.generate", "papers.export", "papers.templates.manage",
+    "papers.translations.manage", "papers.reports.view",
+  ],
+  student: ["question_banks.view", "papers.view", "papers.export", "papers.reports.view"],
 };
 
 function loadUsers() {
@@ -43,7 +79,9 @@ function loadUsers() {
 }
 
 function saveUsers(users) {
-  const dir = config.usersFile.slice(0, config.usersFile.lastIndexOf("/"));
+  // path.dirname (not string slicing): Windows separators made the old slice
+  // produce a file-less path like "data\roles.jso" and mkdir a junk directory.
+  const dir = path.dirname(config.usersFile);
   mkdirSync(dir, { recursive: true });
   writeFileSync(config.usersFile, JSON.stringify({ version: 1, users }, null, 2), "utf-8");
 }
@@ -148,7 +186,25 @@ export const fileRepo = {
   },
 
   listRoles() {
-    return ROLES;
+    return [...ROLES, ...loadRoles()];
+  },
+
+  createRole({ code, name, description }) {
+    const custom = loadRoles();
+    if (custom.some((r) => r.code === code)) {
+      const err = new Error("Role code already exists");
+      err.code = "ROLE_EXISTS";
+      throw err;
+    }
+    custom.push({ code, name, description: description || null });
+    saveRoles(custom);
+    return { code, name, description: description || null };
+  },
+
+  deleteRole(code) {
+    const custom = loadRoles().filter((r) => r.code !== code);
+    saveRoles(custom);
+    return true;
   },
 
   listPermissions() {
@@ -180,7 +236,7 @@ function loadResets() {
 }
 
 function saveResets(store) {
-  const dir = config.resetsFile.slice(0, config.resetsFile.lastIndexOf("/"));
+  const dir = path.dirname(config.resetsFile);
   mkdirSync(dir, { recursive: true });
   writeFileSync(config.resetsFile, JSON.stringify(store, null, 2), "utf-8");
 }

@@ -103,6 +103,7 @@ import {
   deleteSchool,
   // Question families & papers (multi-language)
   listQuestionVariants,
+  listQuestionVariantsByFamilies,
   linkQuestionToFamily,
   listPapers,
   getPaperById,
@@ -111,9 +112,74 @@ import {
   deletePaper,
   getPaperLanguages,
   getPaperInLanguage,
+  getPaperInLanguageStrict,
+  getPaperBlueprint,
+  getPaperSets,
+  updatePaperSets,
+  updatePaperTranslations,
+  updateQuestionTranslationStatus,
+  // Separate language paper generation (Phase 9)
+  listLanguagePapers,
+  createLanguagePaper,
+  getLanguagePaperData,
+  updateLanguagePaperStatus,
+  deleteLanguagePaper,
+  // Reusable paper templates (Phase 11)
+  listPaperTemplates,
+  getDefaultPaperTemplate,
+  getPaperTemplate,
+  createPaperTemplate,
+  updatePaperTemplate,
+  deletePaperTemplate,
+  // Paper versioning & history (Phase 15)
+  listPaperVersions,
+  getLatestPaperVersion,
+  getPaperVersion,
+  insertPaperVersion,
+  restorePaperFromSnapshot,
+  // Paper lifecycle management (Phase 16)
+  transitionPaperStatus,
+  duplicatePaper,
 } from "./supabase.js";
+import {
+  normalizeBlueprint,
+  validateBlueprint,
+  previewBlueprintAvailability,
+  selectQuestionsForBlueprint,
+  computePaperStructure,
+  findReplacement,
+  validatePaper,
+  generateSetsDoc,
+  computeSetAnswerKey,
+  computeTranslationReport,
+  computeSetAnswerKeyInLanguage,
+  buildLanguagePaperSnapshot,
+  resolveSetQuestionAnswer,
+  buildPaperReport,
+  buildPaperAnalysis,
+  buildPaperSnapshot,
+  diffPaperSnapshots,
+  canTransitionPaper,
+  computeStatusAfterContentEdit,
+} from "./paperService.js";
+import { buildPaperHtml, htmlToPdfBuffer } from "./pdfRenderer.js";
 
-const VALID_ROLES = new Set(["super_admin", "teacher", "student"]);
+const TRANSLATION_WORKFLOW_STATES = ["draft", "translated", "reviewed", "approved"];
+const LANGUAGE_PAPER_STATES = ["draft", "generated", "approved", "archived"];
+
+const BASE_VALID_ROLES = new Set(["super_admin", "teacher", "student"]);
+// Custom roles (created via Roles & Permissions) are also assignable — resolved
+// against the roles table/fallback at request time.
+async function isValidRole(role) {
+  if (BASE_VALID_ROLES.has(role)) return true;
+  if (typeof role !== "string" || role.length === 0) return false;
+  try {
+    const roles = await listRoles();
+    return roles.some((r) => r.code === role);
+  } catch {
+    return false;
+  }
+}
 const VALID_PERMISSIONS = new Set(Object.values(PERMISSIONS));
 
 const app = express();
@@ -418,7 +484,7 @@ app.post(
       if (typeof password !== "string" || password.length < 8 || password.length > 256) {
         return res.status(400).json({ error: "Password must be 8+ characters.", code: "VALIDATION" });
       }
-      if (!VALID_ROLES.has(role)) {
+      if (!(await isValidRole(role))) {
         return res.status(400).json({ error: "Invalid role.", code: "VALIDATION" });
       }
       if (!isSafeProfileImage(profileImage) || !isSafeDate(dateOfBirth) || !isSafeDate(hireDate) || !isSafeOptional(phone, 30) || !isSafeOptional(gender, 20) || !isSafeOptional(address, 500) || !isSafeOptional(subject, 120) || !isSafeOptional(qualification, 200)) {
@@ -539,7 +605,7 @@ app.put(
   async (req, res, next) => {
     try {
       const { role } = req.body ?? {};
-      if (!VALID_ROLES.has(role)) {
+      if (!(await isValidRole(role))) {
         return res.status(400).json({ error: "Invalid role.", code: "VALIDATION" });
       }
       // Protect the seeded super admin from self-demotion.
@@ -604,7 +670,7 @@ app.post(
       });
       res.status(201).json({ role: created });
     } catch (err) {
-      if (String(err?.message || "").includes("duplicate")) {
+      if (String(err?.message || "").includes("duplicate") || err?.code === "ROLE_EXISTS") {
         return res.status(409).json({ error: "Role code already exists.", code: "DUPLICATE" });
       }
       next(err);
@@ -1082,8 +1148,12 @@ app.get("/api/admin/questions", requireAuth, requirePermission(PERMISSIONS.QUEST
     if (updated_from) filters.updated_from = updated_from;
     if (updated_to) filters.updated_to = updated_to;
     filters.with_usage = with_usage === "true" || with_usage === "1";
-    filters.limit = parseInt(limit, 10) || 50;
-    filters.offset = parseInt(offset, 10) || 0;
+    // Performance/memory guard: clamp page size so a huge `limit` can't pull
+    // the whole question bank into memory in one response.
+    const parsedLimit = parseInt(limit, 10);
+    const parsedOffset = parseInt(offset, 10);
+    filters.limit = Math.min(Math.max(Number.isFinite(parsedLimit) ? parsedLimit : 50, 1), 500);
+    filters.offset = Math.max(Number.isFinite(parsedOffset) ? parsedOffset : 0, 0);
     const questions = await listQuestions(filters);
     const total = await countQuestions({ ...filters, limit: undefined, offset: undefined, with_usage: undefined });
     res.json({ questions, total, limit: filters.limit, offset: filters.offset, with_usage: filters.with_usage });
@@ -1317,25 +1387,43 @@ app.delete("/api/admin/tests/:id", requireAuth, requirePermission(PERMISSIONS.QU
 // ---------------------------------------------------------------
 // Admin: Papers (multi-language question papers)
 // ---------------------------------------------------------------
-app.get("/api/admin/papers", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_VIEW), async (req, res, next) => {
+app.get("/api/admin/papers", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
   try {
     const { status, limit, offset } = req.query ?? {};
     const isSuperAdmin = req.user?.role === "super_admin";
+    // Performance/memory guard: clamp page size and offset so unbounded
+    // requests can't force huge result sets into memory.
+    const parsedLimit = parseInt(limit, 10);
+    const parsedOffset = parseInt(offset, 10);
     const result = await listPapers({
       status: typeof status === "string" ? status : undefined,
       created_by: isSuperAdmin ? undefined : req.user.sub,
-      limit: parseInt(limit, 10) || 100,
-      offset: parseInt(offset, 10) || 0,
+      limit: Math.min(Math.max(Number.isFinite(parsedLimit) ? parsedLimit : 100, 1), 200),
+      offset: Math.max(Number.isFinite(parsedOffset) ? parsedOffset : 0, 0),
     });
     res.json(result);
   } catch (err) { next(err); }
 });
 
-app.post("/api/admin/papers", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_MANAGE), async (req, res, next) => {
+app.post("/api/admin/papers", requireAuth, requirePermission(PERMISSIONS.PAPERS_MANAGE), async (req, res, next) => {
   try {
     const b = req.body ?? {};
     if (!isSafeIdentifier(b.title)) return res.status(400).json({ error: "Title is required.", code: "VALIDATION" });
-    const familyIds = Array.isArray(b.familyIds) ? b.familyIds.filter((x) => typeof x === "string") : [];
+    // Papers always enter the lifecycle as drafts (Phase 16): publishing runs
+    // through the validation gate, which needs questions — impossible for a
+    // brand-new empty paper.
+    if (b.status && b.status !== "draft") {
+      return res.status(400).json({
+        error: "New papers are always created as drafts. Publish after validation from the paper detail page.",
+        code: "LIFECYCLE_CREATION_BLOCKED",
+      });
+    }
+    // familyIds entries: "<uuid>" (legacy) or { familyId, marks } (Paper Generator).
+    const familyIds = Array.isArray(b.familyIds)
+      ? b.familyIds
+          .map((x) => (typeof x === "string" ? { familyId: x, marks: 0 } : x))
+          .filter((x) => x && typeof x.familyId === "string" && x.familyId)
+      : [];
     const created = await createPaper({
       title: b.title.trim(),
       description: isSafeOptional(b.description, 2000) ? b.description : undefined,
@@ -1348,11 +1436,14 @@ app.post("/api/admin/papers", requireAuth, requirePermission(PERMISSIONS.QUESTIO
       created_by: req.user.sub,
       familyIds,
     });
+    if (created?.paper?.id) {
+      await capturePaperVersion(created.paper.id, { reason: "created", createdBy: req.user.sub });
+    }
     res.status(201).json(created);
   } catch (err) { next(err); }
 });
 
-app.get("/api/admin/papers/:id", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_VIEW), async (req, res, next) => {
+app.get("/api/admin/papers/:id", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
   try {
     const result = await getPaperById(req.params.id);
     if (!result) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
@@ -1360,7 +1451,7 @@ app.get("/api/admin/papers/:id", requireAuth, requirePermission(PERMISSIONS.QUES
   } catch (err) { next(err); }
 });
 
-app.patch("/api/admin/papers/:id", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_MANAGE), async (req, res, next) => {
+app.patch("/api/admin/papers/:id", requireAuth, requirePermission(PERMISSIONS.PAPERS_MANAGE), async (req, res, next) => {
   try {
     const existing = await getPaperById(req.params.id);
     if (!existing) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
@@ -1370,23 +1461,474 @@ app.patch("/api/admin/papers/:id", requireAuth, requirePermission(PERMISSIONS.QU
     for (const key of ["title", "description", "standard_id", "subject_id", "exam_type_id", "duration_min", "total_marks", "status"]) {
       if (b[key] !== undefined) patch[key] = b[key];
     }
-    const familyIds = Array.isArray(b.familyIds) ? b.familyIds.filter((x) => typeof x === "string") : undefined;
+    // Lifecycle state machine (Phase 16): status changes must follow the
+    // transition allowlist — published is a sink toward archived, and archived
+    // can only leave via restore → draft (dedicated /archive and /restore
+    // endpoints exist for those flows). Keeps PATCH from bypassing the
+    // state machine that the dedicated endpoints enforce.
+    if (
+      patch.status !== undefined &&
+      patch.status !== existing.paper.status &&
+      !canTransitionPaper(existing.paper.status, patch.status)
+    ) {
+      return res.status(409).json({
+        error: `Papers in state "${existing.paper.status}" cannot move to "${patch.status}".`,
+        code: "TRANSITION_BLOCKED",
+        from: existing.paper.status,
+        to: patch.status,
+      });
+    }
+    // Archived papers are read-only (Phase 16): metadata/content edits are
+    // blocked until the paper is restored to draft via POST /restore.
+    if (existing.paper.status === "archived" && Object.keys(patch).some((k) => k !== "status")) {
+      return res.status(409).json({
+        error: "Archived papers are read-only. Restore it to draft to make changes.",
+        code: "ARCHIVED_ACTION_BLOCKED",
+        status: "archived",
+      });
+    }
+    // Status gate (Paper Generator Phase 6/16): any transition into
+    // "published" or "validated" must pass the full validation suite — critical
+    // errors block the transition. Only the status transition is gated; no
+    // other field or behavior changes.
+    const isValidationGateTransition =
+      (patch.status === "published" && existing.paper.status !== "published") ||
+      (patch.status === "validated" && existing.paper.status !== "validated");
+    if (isValidationGateTransition) {
+      const stored = await getPaperBlueprint(req.params.id);
+      const languages = await listLanguages().catch(() => []);
+      const usedLangs = new Set();
+      for (const f of existing.families) {
+        for (const v of f.variants ?? []) if (v.language_id) usedLangs.add(v.language_id);
+      }
+      const report = validatePaper(existing.paper, existing.families, stored?.blueprint ?? null, {
+        languages,
+        requiredLanguages: [...usedLangs].map((id) => {
+          const lang = languages.find((l) => l.id === id);
+          return lang ? { id: lang.id, name: lang.name } : { id, name: id };
+        }),
+        migrationRequired: stored?.migrationRequired === true,
+      });
+      if (!report.summary.canPublish) {
+        return res.status(409).json({
+          error: patch.status === "published"
+            ? `Paper cannot be published — ${report.summary.errors} critical issue(s) found. Run validation for details.`
+            : `Paper cannot be validated — ${report.summary.errors} critical issue(s) found. Run validation for details.`,
+          code: patch.status === "published" ? "PUBLICATION_BLOCKED" : "VALIDATION_BLOCKED",
+          summary: report.summary,
+          results: report.results.filter((r) => r.level === "ERROR"),
+        });
+      }
+    }
+    // A "validated" paper that gets content-edited (family list or any field
+    // other than a lifecycle status change) reverts to draft so the admin must
+    // re-validate before it can be published again.
+    if (existing.paper.status === "validated") {
+      const contentKeys = Object.keys(patch).filter((k) => k !== "status");
+      if (contentKeys.length > 0) {
+        patch.status = computeStatusAfterContentEdit("validated", b.status === "validated" || b.status === "published" ? b.status : undefined);
+      }
+    }
+    const familyIds = Array.isArray(b.familyIds)
+      ? b.familyIds
+          .map((x) => (typeof x === "string" ? { familyId: x, marks: 0 } : x))
+          .filter((x) => x && typeof x.familyId === "string" && x.familyId)
+      : undefined;
     const updated = await updatePaper(req.params.id, patch, familyIds);
+    // Lifecycle clock: stamp validated_at/published_at/archived_at exactly when
+    // the paper crosses that boundary (best-effort pre-migration 013).
+    if (patch.status === "validated" && existing.paper.status !== "validated") {
+      await transitionPaperStatus(req.params.id, "validated").catch(() => {});
+    } else if (patch.status === "archived" && existing.paper.status !== "archived") {
+      await transitionPaperStatus(req.params.id, "archived").catch(() => {});
+    }
+    // Auto-capture a "published" version whenever a paper crosses into
+    // published — this pins exactly what was released. Best-effort: a
+    // missing migration never fails the publish itself.
+    if (patch.status === "published" && existing.paper.status !== "published") {
+      await transitionPaperStatus(req.params.id, "published").catch(() => {});
+      await capturePaperVersion(req.params.id, { reason: "published", createdBy: req.user.sub });
+    }
     res.json(updated);
   } catch (err) { next(err); }
 });
 
-app.delete("/api/admin/papers/:id", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_MANAGE), async (req, res, next) => {
+app.delete("/api/admin/papers/:id", requireAuth, requirePermission(PERMISSIONS.PAPERS_DELETE), async (req, res, next) => {
   try {
+    const existing = await getPaperById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    // Never destroy released data through a normal UI action (Phase 16): a
+    // published paper must be archived first, keeping version history intact.
+    if (existing.paper.status === "published") {
+      return res.status(409).json({
+        error: "Published papers cannot be deleted directly. Archive it first — past versions are preserved automatically.",
+        code: "PUBLISHED_DELETION_BLOCKED",
+        status: existing.paper.status,
+      });
+    }
     const removed = await deletePaper(req.params.id);
-    if (!removed) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
     res.json({ deleted: true });
+  } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
+// Paper Lifecycle Management (Paper Generator Phase 16)
+// ---------------------------------------------------------------
+// The full Draft → Validated → Published → Archived lifecycle. Dedicated
+// endpoints keep every transition explicit and auditable; the timestamp
+// columns (validated_at/published_at/archived_at) are stamped on transition.
+// All require QUESTION_BANKS_MANAGE except PDF export (VIEW).
+
+// Validate + promote a paper to "validated". Read-only re-validation of an
+// already-validated/published paper is allowed (returns the fresh report).
+app.post("/api/admin/papers/:id/validate", requireAuth, requirePermission(PERMISSIONS.PAPERS_PUBLISH), async (req, res, next) => {
+  try {
+    const loaded = await getPaperById(req.params.id);
+    if (!loaded) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    if (loaded.paper.status === "archived") {
+      return res.status(409).json({
+        error: "Archived papers cannot be validated. Restore it first.",
+        code: "ARCHIVED_ACTION_BLOCKED",
+        status: loaded.paper.status,
+      });
+    }
+    const stored = await getPaperBlueprint(req.params.id);
+    const languages = await listLanguages().catch(() => []);
+    const usedLangs = new Set();
+    for (const f of loaded.families) {
+      for (const v of f.variants ?? []) if (v.language_id) usedLangs.add(v.language_id);
+    }
+    const report = validatePaper(loaded.paper, loaded.families, stored?.blueprint ?? null, {
+      languages,
+      requiredLanguages: [...usedLangs].map((id) => {
+        const lang = languages.find((l) => l.id === id);
+        return lang ? { id: lang.id, name: lang.name } : { id, name: id };
+      }),
+      migrationRequired: stored?.migrationRequired === true,
+    });
+    if (!report.summary.canPublish) {
+      return res.status(409).json({
+        error: `Paper cannot be validated — ${report.summary.errors} critical issue(s) found.`,
+        code: "VALIDATION_BLOCKED",
+        summary: report.summary,
+        results: report.results.filter((r) => r.level === "ERROR"),
+      });
+    }
+    let promoted = false;
+    if (loaded.paper.status === "draft" || loaded.paper.status === "validated") {
+      await transitionPaperStatus(req.params.id, "validated");
+      promoted = true;
+    }
+    res.json({ validated: true, promoted, status: "validated", summary: report.summary });
+  } catch (err) { next(err); }
+});
+
+// Duplicate a paper as a new draft (families + blueprint + translations; sets
+// are deliberately not copied).
+app.post("/api/admin/papers/:id/duplicate", requireAuth, requirePermission(PERMISSIONS.PAPERS_MANAGE), async (req, res, next) => {
+  try {
+    const existed = await getPaperById(req.params.id);
+    if (!existed) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    const created = await duplicatePaper(req.params.id, req.user.sub);
+    if (!created?.paper?.id) {
+      return res.status(500).json({ error: "Could not duplicate paper.", code: "DUPLICATE_FAILED" });
+    }
+    await capturePaperVersion(created.paper.id, {
+      reason: "created",
+      note: `Duplicated from "${existed.paper.title}"`,
+      createdBy: req.user.sub,
+    });
+    res.status(201).json(created);
+  } catch (err) { next(err); }
+});
+
+// Archive a paper. Allowed from draft/validated/published. Idempotent: an
+// already-archived paper stays archived.
+app.post("/api/admin/papers/:id/archive", requireAuth, requirePermission(PERMISSIONS.PAPERS_DELETE), async (req, res, next) => {
+  try {
+    const loaded = await getPaperById(req.params.id);
+    if (!loaded) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    if (loaded.paper.status === "archived") {
+      return res.json({ archived: true, status: "archived" });
+    }
+    if (!canTransitionPaper(loaded.paper.status, "archived")) {
+      return res.status(409).json({
+        error: `Papers in state "${loaded.paper.status}" cannot be archived.`,
+        code: "TRANSITION_BLOCKED",
+        from: loaded.paper.status,
+        to: "archived",
+      });
+    }
+    await transitionPaperStatus(req.params.id, "archived");
+    res.json({ archived: true, status: "archived" });
+  } catch (err) { next(err); }
+});
+
+// Restore an archived paper back to draft (lifecycle restore). Distinct from
+// POST /versions/:version/restore which re-materializes historical content.
+app.post("/api/admin/papers/:id/restore", requireAuth, requirePermission(PERMISSIONS.PAPERS_MANAGE), async (req, res, next) => {
+  try {
+    const loaded = await getPaperById(req.params.id);
+    if (!loaded) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    if (loaded.paper.status !== "archived") {
+      return res.status(409).json({
+        error: "Only archived papers can be restored to draft.",
+        code: "NOT_ARCHIVED",
+        status: loaded.paper.status,
+      });
+    }
+    await transitionPaperStatus(req.params.id, "draft", { clear: ["archived_at"] });
+    res.json({ restored: true, status: "draft" });
+  } catch (err) { next(err); }
+});
+
+// Export a paper to PDF (server-rendered via Puppeteer + KaTeX). Optional
+// `language` selects the resolved language; leave it out for primary variants.
+app.get("/api/admin/papers/:id/pdf", requireAuth, requirePermission(PERMISSIONS.PAPERS_EXPORT), async (req, res, next) => {
+  try {
+    const loaded = await getPaperById(req.params.id);
+    if (!loaded) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+
+    const langId = typeof req.query.language === "string" ? req.query.language : null;
+    let questions = [];
+    let languageName = null;
+
+    if (langId) {
+      const languages = await listLanguages().catch(() => []);
+      const lang = languages.find((l) => l.id === langId);
+      languageName = lang?.name ?? null;
+      const resolved = await getPaperInLanguageStrict(req.params.id, langId, {
+        mode: req.query.mode === "strict" ? "strict" : "substitute",
+      });
+      questions = (resolved?.questions ?? []).map((q) => ({
+        ...q.question,
+        marks: Number(q.marks) || 0,
+        section_key: q.section_key ?? null,
+      }));
+    } else {
+      // Primary variant per family (the language each family was assigned to).
+      const languageById = new Map(
+        (await listLanguages().catch(() => [])).map((l) => [l.id, l])
+      );
+      for (const fam of loaded.families) {
+        if (fam.primary) {
+          if (!languageName && fam.primary.language_id) {
+            const lang = languageById.get(fam.primary.language_id);
+            if (lang) languageName = lang.name;
+          }
+          questions.push({
+            ...fam.primary,
+            marks: Number(fam.marks) || Number(fam.primary.marks) || 0,
+            section_key: fam.section_key ?? null,
+          });
+        }
+      }
+    }
+
+    const html = buildPaperHtml(loaded.paper, questions, {
+      title: loaded.paper.title,
+      description: loaded.paper.description,
+      durationMin: loaded.paper.duration_min,
+      totalMarks: loaded.paper.total_marks,
+      languageName,
+    });
+    const pdf = await htmlToPdfBuffer(html);
+    const slug = String(loaded.paper.title || "paper")
+      .replace(/[^\w\s-]+/g, "-")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 60) || "paper";
+    const langSlug = langId
+      ? `${(languageName || langId).replace(/[^\w-]+/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "") || "lang"}`
+      : "paper";
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${slug}-${langSlug}.pdf"`);
+    res.send(Buffer.from(pdf));
   } catch (err) { next(err); }
 });
 
 // Key endpoint: paper resolved to a requested language. Any authenticated
 // teacher can print a paper; the resolved content excludes answer keys.
-app.get("/api/admin/papers/:id/print", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_VIEW), async (req, res, next) => {
+// ---------------------------------------------------------------
+// Paper structure (Paper Generator Phase 4)
+// ---------------------------------------------------------------
+// Effective structure: ordered sections with per-section metadata, global
+// question numbering and totals (total questions, total marks, maximum
+// possible score, minimum score under negative marking). Backward compatible:
+// papers without a blueprint render as a single implicit section.
+app.get("/api/admin/papers/:id/structure", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const loaded = await getPaperById(req.params.id);
+    if (!loaded) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    const stored = await getPaperBlueprint(req.params.id);
+    const blueprint = stored?.blueprint ?? null;
+    const structure = computePaperStructure(loaded.paper, loaded.families, blueprint);
+    res.json({
+      paper: loaded.paper,
+      blueprint: blueprint,
+      ...structure,
+      migrationRequired: stored?.migrationRequired === true,
+    });
+  } catch (err) { next(err); }
+});
+
+// Paper Validation Engine (Paper Generator Phase 6)
+// ---------------------------------------------------------------
+// Runs the full pre-publish validation suite (duplicates, required data,
+// options/answers, media, blueprint & section compliance, counts, marks,
+// negative marking, language coverage). Read-only: never mutates content.
+// `?requiredLanguage=<id>` marks languages the paper must fully cover.
+app.get("/api/admin/papers/:id/validate", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const loaded = await getPaperById(req.params.id);
+    if (!loaded) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    const stored = await getPaperBlueprint(req.params.id);
+    const languages = await listLanguages().catch(() => []);
+    // Required languages: explicit query params, defaulting to every language
+    // that at least one variant already uses (keeps existing papers valid).
+    let requiredLanguageIds = Array.isArray(req.query.requiredLanguage)
+      ? req.query.requiredLanguage
+      : req.query.requiredLanguage
+      ? [req.query.requiredLanguage]
+      : null;
+    if (!requiredLanguageIds) {
+      const used = new Set();
+      for (const f of loaded.families) {
+        for (const v of f.variants ?? []) if (v.language_id) used.add(v.language_id);
+      }
+      requiredLanguageIds = [...used];
+    }
+    const requiredLanguages = requiredLanguageIds
+      .map((id) => {
+        const lang = languages.find((l) => l.id === id);
+        return lang ? { id: lang.id, name: lang.name } : { id, name: id };
+      })
+      .filter(Boolean);
+    const report = validatePaper(loaded.paper, loaded.families, stored?.blueprint ?? null, {
+      languages,
+      requiredLanguages,
+      migrationRequired: stored?.migrationRequired === true,
+    });
+    res.json({ paperId: loaded.paper.id, ...report });
+  } catch (err) { next(err); }
+});
+
+// Replace the ordered family list with explicit section assignments
+// ({ familyId, marks, sectionKey }[]). Same guard set as papers PATCH.
+app.put("/api/admin/papers/:id/families", requireAuth, requirePermission(PERMISSIONS.PAPERS_MANAGE), async (req, res, next) => {
+  try {
+    const existing = await getPaperById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    if (existing.paper.status === "archived") {
+      return res.status(409).json({
+        error: "Archived papers are read-only. Restore it to draft first.",
+        code: "ARCHIVED_ACTION_BLOCKED",
+        status: "archived",
+      });
+    }
+    const list = Array.isArray(req.body?.families) ? req.body.families : [];
+    const entries = list
+      .map((x) => (typeof x === "string" ? { familyId: x, marks: 0 } : x))
+      .filter((x) => x && typeof x.familyId === "string" && x.familyId);
+    const updated = await updatePaper(req.params.id, {}, entries);
+    res.json(updated);
+  } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
+// Replace question (Paper Generator Phase 5)
+// ---------------------------------------------------------------
+// Swaps one family reference inside the paper for another. The replacement is
+// chosen by a deterministic relaxation ladder (exact → topic → chapter → type
+// → difficulty → any), constrained to the paper's standard/subject, published
+// only, and never a family already in the paper. The original Question Bank
+// question is never modified. With body { dryRun: true } nothing is saved —
+// the proposed match is returned for preview.
+app.post("/api/admin/papers/:id/families/:familyId/replace", requireAuth, requirePermission(PERMISSIONS.PAPERS_MANAGE), async (req, res, next) => {
+  try {
+    const loaded = await getPaperById(req.params.id);
+    if (!loaded) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    if (loaded.paper.status === "archived") {
+      return res.status(409).json({
+        error: "Archived papers are read-only. Restore it to draft first.",
+        code: "ARCHIVED_ACTION_BLOCKED",
+        status: "archived",
+      });
+    }
+    const currentRef = loaded.families.find((f) => f.family_id === req.params.familyId);
+    if (!currentRef) {
+      return res.status(404).json({ error: "Question family not found on this paper.", code: "NOT_FOUND" });
+    }
+
+    const paper = loaded.paper;
+    const candidates = await listQuestions({
+      status: "published",
+      standard_id: paper.standard_id || undefined,
+      subject_id: paper.subject_id || undefined,
+      limit: 500,
+    });
+    const excludeFamilyIds = loaded.families.map((f) => f.family_id);
+    const replacement = findReplacement(
+      candidates,
+      {
+        familyId: req.params.familyId,
+        chapterId: currentRef.primary?.chapter_id ?? null,
+        topicId: currentRef.primary?.topic_id ?? null,
+        type: currentRef.primary?.type ?? null,
+        difficulty: currentRef.primary?.difficulty ?? null,
+        marks: Number(currentRef.marks) || (currentRef.primary?.marks ?? null),
+      },
+      excludeFamilyIds,
+      req.body?.seed || `replace:${req.params.id}:${req.params.familyId}`
+    );
+
+    if (!replacement.question) {
+      // Clear feedback instead of a silent substitute.
+      return res.status(409).json({
+        error: "No suitable replacement exists.",
+        code: "REPLACEMENT_UNAVAILABLE",
+        reason: replacement.reason,
+      });
+    }
+
+    if (req.body?.dryRun) {
+      return res.json({
+        dryRun: true,
+        match: replacement.match,
+        exact: replacement.exact,
+        replacement: replacement.question,
+      });
+    }
+
+    // Swap the reference in place: same position, marks, section and lock state.
+    const entries = loaded.families.map((f) => ({
+      familyId: f.family_id,
+      marks: Number(f.marks) || 0,
+      sectionKey: f.section_key || undefined,
+      locked: Boolean(f.locked),
+    }));
+    const idx = entries.findIndex((e) => e.familyId === req.params.familyId);
+    entries[idx] = {
+      familyId: replacement.question.family_id,
+      marks: entries[idx].marks,
+      sectionKey: entries[idx].sectionKey,
+      locked: entries[idx].locked,
+    };
+    const updated = await updatePaper(req.params.id, {}, entries);
+    if (!updated) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+
+    res.json({
+      match: replacement.match,
+      exact: replacement.exact,
+      replacedWith: replacement.question,
+      families: updated.families,
+      paper: updated.paper,
+    });
+  } catch (err) { next(err); }
+});
+
+app.get("/api/admin/papers/:id/print", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
   try {
     const { language } = req.query ?? {};
     if (!language || typeof language !== "string") {
@@ -1398,11 +1940,913 @@ app.get("/api/admin/papers/:id/print", requireAuth, requirePermission(PERMISSION
   } catch (err) { next(err); }
 });
 
-app.get("/api/admin/papers/:id/languages", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_VIEW), async (req, res, next) => {
+// ---------------------------------------------------------------
+// Multilingual Paper Engine (Paper Generator Phase 8)
+// ---------------------------------------------------------------
+// Language-aware paper rendering. Query `mode=strict` reports translation
+// gaps instead of substituting other-language variants (the legacy `print`
+// route above keeps its substitution behavior for backward compatibility).
+app.get("/api/admin/papers/:id/language", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const { language, mode } = req.query ?? {};
+    if (!language || typeof language !== "string") {
+      return res.status(400).json({ error: "language query param is required.", code: "VALIDATION" });
+    }
+    const result = await getPaperInLanguageStrict(req.params.id, language, {
+      mode: mode === "strict" ? "strict" : "substitute",
+    });
+    if (!result) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// Full translation readiness report for every configured language.
+app.get("/api/admin/papers/:id/translations", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const loaded = await getPaperById(req.params.id);
+    if (!loaded) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    const languages = await listLanguages().catch(() => []);
+    const stored = await getPaperSets(req.params.id).catch(() => null);
+    const doc = stored?.translations ?? null;
+    const report = computeTranslationReport(loaded.families, languages, doc);
+    res.json({ paperId: loaded.paper.id, translations: doc, ...report });
+  } catch (err) { next(err); }
+});
+
+// Save the paper's per-language readiness doc (state/note/section
+// instructions per language). Body: { translations: {...} } or null to clear.
+app.put("/api/admin/papers/:id/translations", requireAuth, requirePermission(PERMISSIONS.PAPERS_TRANSLATIONS_MANAGE), async (req, res, next) => {
+  try {
+    const existing = await getPaperById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    const doc = req.body?.translations;
+    if (doc !== null && (typeof doc !== "object" || Array.isArray(doc))) {
+      return res.status(400).json({ error: "translations must be an object or null.", code: "VALIDATION" });
+    }
+    try {
+      await updatePaperTranslations(req.params.id, doc ?? null);
+    } catch (err) {
+      if (/Translation storage is not available/i.test(String(err?.message))) {
+        return res.status(503).json({
+          error: err.message,
+          code: "TRANSLATION_STORAGE_UNAVAILABLE",
+          migrationRequired: true,
+        });
+      }
+      throw err;
+    }
+    res.json({ saved: true, translations: doc ?? null });
+  } catch (err) { next(err); }
+});
+
+// Set the workflow state on ONE question variant (a single language version
+// of a logical question). The variant is not otherwise modified.
+app.patch("/api/admin/questions/:id/translation-status", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_MANAGE), async (req, res, next) => {
+  try {
+    const question = await getQuestionById(req.params.id);
+    if (!question) return res.status(404).json({ error: "Question not found.", code: "NOT_FOUND" });
+    const status = req.body?.status;
+    if (!TRANSLATION_WORKFLOW_STATES.includes(status)) {
+      return res.status(400).json({
+        error: "status must be one of draft | translated | reviewed | approved.",
+        code: "VALIDATION",
+      });
+    }
+    try {
+      await updateQuestionTranslationStatus(req.params.id, status);
+    } catch (err) {
+      if (/Translation state storage is not available/i.test(String(err?.message))) {
+        return res.status(503).json({
+          error: err.message,
+          code: "TRANSLATION_STORAGE_UNAVAILABLE",
+          migrationRequired: true,
+        });
+      }
+      throw err;
+    }
+    res.json({ question: await getQuestionById(req.params.id) });
+  } catch (err) { next(err); }
+});
+
+app.get("/api/admin/papers/:id/languages", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
   try {
     const result = await getPaperLanguages(req.params.id);
     if (!result) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
     res.json(result);
+  } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
+// Separate Language Paper Generation (Paper Generator Phase 9)
+// ---------------------------------------------------------------
+// A language paper is a derived artifact of the master paper. Question
+// families always come from the master (NEVER re-selected per language);
+// only the language-specific text changes. Version metadata + master
+// traceability ship on every generated representation.
+app.get("/api/admin/papers/:id/language-papers", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const master = await getPaperById(req.params.id);
+    if (!master) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    const versions = await listLanguagePapers(req.params.id).catch((err) => {
+      if (/Language paper storage is not available/i.test(String(err?.message))) return { list: [], migrationRequired: true };
+      throw err;
+    });
+    const papers = Array.isArray(versions) ? versions : [];
+    const migrationRequired = Array.isArray(versions) ? false : versions.migrationRequired;
+    const languages = await listLanguages().catch(() => []);
+    const langById = new Map(languages.map((l) => [l.id, l]));
+    res.json({
+      paperId: req.params.id,
+      masterTitle: master.paper.title,
+      languages: [...new Set(papers.map((p) => p.language_id))].map((id) => {
+        const lang = langById.get(id) ?? null;
+        return { id, code: lang?.code ?? null, name: lang?.name ?? id };
+      }),
+      migrationRequired,
+      papers: papers.map((p) => ({
+        ...p,
+        language: langById.get(p.language_id) ?? { id: p.language_id, code: null, name: p.language_id },
+      })),
+    });
+  } catch (err) { next(err); }
+});
+
+// Generate a language paper artifact. Body: { languageId, setKey?, mode? }.
+app.post("/api/admin/papers/:id/language-papers", requireAuth, requirePermission(PERMISSIONS.PAPERS_TRANSLATIONS_MANAGE), async (req, res, next) => {
+  try {
+    const { languageId, setKey, mode } = req.body ?? {};
+    if (!languageId || typeof languageId !== "string") {
+      return res.status(400).json({ error: "languageId is required.", code: "VALIDATION" });
+    }
+    const master = await getPaperById(req.params.id);
+    if (!master) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+
+    const languages = await listLanguages().catch(() => []);
+    const language = languages.find((l) => l.id === languageId);
+    if (!language) {
+      return res.status(400).json({ error: "Unknown language.", code: "VALIDATION" });
+    }
+
+    const blueprint = await getPaperBlueprint(req.params.id).catch(() => null);
+
+    // Explicit randomization reuses a STORED set's family order; the family
+    // set itself is never changed and no questions are re-selected.
+    let orderFamilyIds = null;
+    let resolvedSetKey = setKey ?? null;
+    if (resolvedSetKey) {
+      const stored = await getPaperSets(req.params.id).catch(() => null);
+      const set = stored?.sets?.sets?.find((s) => s.key === resolvedSetKey);
+      if (set) orderFamilyIds = set.questions.map((q) => q.familyId);
+      else {
+        resolvedSetKey = null;
+        // fall through with master order; generation still succeeds
+      }
+    }
+
+    const { snapshot, errors, warnings } = buildLanguagePaperSnapshot(
+      master.paper,
+      master.families,
+      languageId,
+      blueprint?.blueprint ?? null,
+      { setKey: resolvedSetKey, orderFamilyIds, mode: mode === "strict" ? "strict" : "substitute" }
+    );
+
+    const generationWarnings = [...warnings];
+    if (resolvedSetKey === null && setKey) generationWarnings.push("Requested randomization set was not found; generated from the master order.");
+
+    if (snapshot && snapshot.missing_count > 0 && mode === "strict") {
+      return res.status(422).json({ error: errors.join(" "), code: "TRANSLATION_INCOMPLETE", missing: snapshot.missing_count, warnings: generationWarnings });
+    }
+    if (!snapshot) {
+      return res.status(422).json({ error: errors.join(" ") || "Cannot generate a language paper for this master paper.", code: "UNSUPPORTED", warnings: generationWarnings });
+    }
+
+    const existing = await listLanguagePapers(req.params.id);
+    const maxVersion = existing.reduce((m, p) => Math.max(m, Number(p.version) || 0), 0);
+    const version = maxVersion + 1;
+
+    let stored;
+    try {
+      stored = await createLanguagePaper({
+        master_paper_id: master.paper.id,
+        language_id: languageId,
+        version,
+        set_key: resolvedSetKey,
+        status: "generated",
+        generated_by: req.user?.id ?? null,
+        snapshot,
+      });
+    } catch (err) {
+      if (/Language paper storage is not available/i.test(String(err?.message))) {
+        return res.status(503).json({ error: err.message, code: "LANGUAGE_PAPER_STORAGE_UNAVAILABLE", migrationRequired: true });
+      }
+      throw err;
+    }
+
+    res.status(201).json({
+      paperId: master.paper.id,
+      language: { id: language.id, code: language.code ?? null, name: language.name },
+      version,
+      status: stored.status,
+      setKey: resolvedSetKey,
+      warnings: generationWarnings,
+      snapshot,
+    });
+  } catch (err) { next(err); }
+});
+
+// Resolve one generated language paper into a full paper representation:
+// language content, answer mapping and section metadata are derived from the
+// SNAPSHOT's resolved variants while the master paper provides structure.
+app.get("/api/admin/papers/:id/language-papers/:version", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    let stored;
+    try {
+      stored = await getLanguagePaperData(req.params.id, Number(req.params.version));
+    } catch (err) {
+      if (/Language paper storage is not available/i.test(String(err?.message))) {
+        return res.status(503).json({ error: err.message, code: "LANGUAGE_PAPER_STORAGE_UNAVAILABLE", migrationRequired: true });
+      }
+      throw err;
+    }
+    if (!stored || !stored.snapshot) return res.status(404).json({ error: "Language paper not found.", code: "NOT_FOUND" });
+
+    const master = await getPaperById(req.params.id);
+    if (!master) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    const languages = await listLanguages().catch(() => []);
+    const language = languages.find((l) => l.id === stored.language_id) ?? null;
+
+    const blueprint = await getPaperBlueprint(req.params.id).catch(() => null);
+    const sets = await getPaperSets(req.params.id).catch(() => null);
+    const sectionNegatives = new Map();
+    for (const s of Array.isArray(blueprint?.blueprint?.sections) ? blueprint.blueprint.sections : []) {
+      sectionNegatives.set(s.id, Number(s.negativeMarks) || 0);
+    }
+    const negativeOf = (sectionKey) => (sectionKey ? sectionNegatives.get(sectionKey) ?? 0 : 0);
+
+    // Per-question negative marks mirror section metadata (0 for unassigned).
+    const snapByFamily = new Map(stored.snapshot.questions.map((q) => [q.family_id, q]));
+
+    const sections = (stored.snapshot.sections ?? []).map((sec) => {
+      const nos = (stored.snapshot.questions ?? [])
+        .filter((q) => q.section_key === sec.key || (!q.section_key && sec.key === "__default__"))
+        .map((q) => q.number);
+      return {
+        key: sec.key,
+        name: sec.name,
+        negativeMarks: Number(sec.negativeMarks) ?? negativeOf(sec.key) ?? 0,
+        questionCount: sec.questionCount ?? nos.length ?? 0,
+      };
+    });
+
+    const questions = [];
+    const missing = [];
+    let substitutedCount = 0;
+    for (const q of stored.snapshot.questions ?? []) {
+      const base = {
+        family_id: q.family_id,
+        number: q.number,
+        sort_order: q.sort_order ?? 0,
+        marks: Number(q.marks) || 0,
+        negative_marks: negativeOf(q.section_key ?? null),
+        section_key: q.section_key ?? null,
+        resolved_language_id: q.resolved_language_id ?? stored.language_id,
+        substituted: q.substituted ?? false,
+        translation_status: q.translation_status ?? "missing",
+        invariant_issues: Array.isArray(q.invariant_issues) ? q.invariant_issues : [],
+        content_hash: q.content_hash ?? null,
+      };
+      if (!q.resolved_variant_id) {
+        missing.push({ ...base, question: null, answer: null });
+        continue;
+      }
+      const variant = snapVariantFor(master, q.family_id, (fam) =>
+        fam.variants?.find((v) => v.id === q.resolved_variant_id) ?? fam.variants?.[0] ?? null
+      );
+      if (!variant) {
+        missing.push({ ...base, question: null, answer: null });
+        continue;
+      }
+      if (base.substituted) substitutedCount += 1;
+      const { answer, displayOptions } = resolveSetQuestionAnswer(variant, null);
+      questions.push({
+        ...base,
+        question: variant,
+        answer,
+        displayOptions,
+      });
+    }
+
+    const translationDoc = sets?.translations ?? null;
+    const sectionInstructions = translationDoc?.languages?.[stored.language_id]?.sections ?? {};
+
+    res.json({
+      paper: {
+        id: master.paper.id,
+        title: master.paper.title,
+        description: master.paper.description ?? null,
+        duration_min: master.paper.duration_min,
+        total_marks: Number(stored.snapshot.total_marks) || master.paper.total_marks,
+        status: master.paper.status,
+      },
+      language: language ? { id: language.id, code: language.code ?? null, name: language.name } : stored.language_id,
+      version: stored.version,
+      status: stored.status,
+      generated_at: stored.generated_at,
+      set_key: stored.set_key,
+      complete: (stored.snapshot.complete ?? false) && missing.length === 0,
+      missing_count: (stored.snapshot.missing_count ?? 0) + missing.length,
+      substituted_count: (stored.snapshot.substituted_count ?? 0) + substitutedCount,
+      sections,
+      sectionInstructions,
+      questions,
+      missing,
+    });
+  } catch (err) { next(err); }
+});
+
+// Update workflow status of one generated language paper.
+app.patch("/api/admin/papers/:id/language-papers/:version", requireAuth, requirePermission(PERMISSIONS.PAPERS_TRANSLATIONS_MANAGE), async (req, res, next) => {
+  try {
+    const status = req.body?.status;
+    if (!LANGUAGE_PAPER_STATES.includes(status)) {
+      return res.status(400).json({
+        error: `status must be one of ${LANGUAGE_PAPER_STATES.join(" | ")}.`,
+        code: "VALIDATION",
+      });
+    }
+    let updated;
+    try {
+      updated = await updateLanguagePaperStatus(req.params.id, Number(req.params.version), status);
+    } catch (err) {
+      if (/Language paper storage is not available/i.test(String(err?.message))) {
+        return res.status(503).json({ error: err.message, code: "LANGUAGE_PAPER_STORAGE_UNAVAILABLE", migrationRequired: true });
+      }
+      throw err;
+    }
+    if (!updated) return res.status(404).json({ error: "Language paper not found.", code: "NOT_FOUND" });
+    res.json({ paperId: req.params.id, version: updated.version, status: updated.status });
+  } catch (err) { next(err); }
+});
+
+// Delete one language paper version.
+app.delete("/api/admin/papers/:id/language-papers/:version", requireAuth, requirePermission(PERMISSIONS.PAPERS_TRANSLATIONS_MANAGE), async (req, res, next) => {
+  try {
+    let deleted;
+    try {
+      deleted = await deleteLanguagePaper(req.params.id, Number(req.params.version));
+    } catch (err) {
+      if (/Language paper storage is not available/i.test(String(err?.message))) {
+        return res.status(503).json({ error: err.message, code: "LANGUAGE_PAPER_STORAGE_UNAVAILABLE", migrationRequired: true });
+      }
+      throw err;
+    }
+    if (!deleted) return res.status(404).json({ error: "Language paper not found.", code: "NOT_FOUND" });
+    res.json({ deleted: true, paperId: req.params.id, version: deleted.version });
+  } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
+// Reusable paper templates (Paper Generator Phase 11)
+// ---------------------------------------------------------------
+const PAPER_TEMPLATE_KINDS = new Set(["single", "bilingual", "custom"]);
+
+function validatePaperTemplateBody(body) {
+  const errors = [];
+  const name = typeof body?.name === "string" ? body.name.trim() : "";
+  if (!name) errors.push("name is required.");
+  const kind = body?.kind ?? "single";
+  if (!PAPER_TEMPLATE_KINDS.has(kind)) errors.push("kind must be one of: single, bilingual, custom.");
+  const config = body?.config && typeof body.config === "object" && !Array.isArray(body.config) ? body.config : {};
+  return { name, kind, config, errors };
+}
+
+// List saved templates. Optional ?kind= filter.
+app.get("/api/admin/templates", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const kind = typeof req.query.kind === "string" ? req.query.kind : undefined;
+    if (kind && !PAPER_TEMPLATE_KINDS.has(kind)) {
+      return res.status(400).json({ error: "Invalid kind filter.", code: "VALIDATION" });
+    }
+    const templates = await listPaperTemplates(kind);
+    res.json({ templates });
+  } catch (err) { next(err); }
+});
+
+// The one flagged default template for a kind.
+app.get("/api/admin/templates/default", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const kind = typeof req.query.kind === "string" ? req.query.kind : "single";
+    if (!PAPER_TEMPLATE_KINDS.has(kind)) {
+      return res.status(400).json({ error: "Invalid kind.", code: "VALIDATION" });
+    }
+    const template = await getDefaultPaperTemplate(kind);
+    res.json({ template });
+  } catch (err) { next(err); }
+});
+
+// Create one template.
+app.post("/api/admin/templates", requireAuth, requirePermission(PERMISSIONS.PAPERS_TEMPLATES_MANAGE), async (req, res, next) => {
+  try {
+    const { name, kind, config, errors } = validatePaperTemplateBody(req.body ?? {});
+    if (errors.length) return res.status(400).json({ error: errors.join(" "), code: "VALIDATION" });
+    const created = await createPaperTemplate({
+      name,
+      description: typeof req.body.description === "string" ? req.body.description : null,
+      kind,
+      config,
+      is_default: Boolean(req.body.is_default),
+      created_by: req.user?.id ?? null,
+    });
+    res.status(201).json({ template: created });
+  } catch (err) {
+    if (/Paper template storage is not available/i.test(String(err?.message))) {
+      return res.status(503).json({ error: err.message, code: "PAPER_TEMPLATE_STORAGE_UNAVAILABLE", migrationRequired: true });
+    }
+    next(err);
+  }
+});
+
+// One saved template.
+app.get("/api/admin/templates/:id", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const template = await getPaperTemplate(req.params.id);
+    if (!template) return res.status(404).json({ error: "Template not found.", code: "NOT_FOUND" });
+    res.json({ template });
+  } catch (err) { next(err); }
+});
+
+// Patch one template (name, description, kind, config, is_default).
+app.patch("/api/admin/templates/:id", requireAuth, requirePermission(PERMISSIONS.PAPERS_TEMPLATES_MANAGE), async (req, res, next) => {
+  try {
+    const body = req.body ?? {};
+    if (body.name !== undefined) {
+      const name = typeof body.name === "string" ? body.name.trim() : "";
+      if (!name) return res.status(400).json({ error: "name cannot be empty.", code: "VALIDATION" });
+    }
+    if (body.kind !== undefined && !PAPER_TEMPLATE_KINDS.has(body.kind)) {
+      return res.status(400).json({ error: "kind must be one of: single, bilingual, custom.", code: "VALIDATION" });
+    }
+    if (body.config !== undefined && (typeof body.config !== "object" || Array.isArray(body.config))) {
+      return res.status(400).json({ error: "config must be an object.", code: "VALIDATION" });
+    }
+    const updated = await updatePaperTemplate(req.params.id, {
+      name: body.name,
+      description: body.description,
+      kind: body.kind,
+      config: body.config,
+      is_default: body.is_default,
+    });
+    if (!updated) return res.status(404).json({ error: "Template not found.", code: "NOT_FOUND" });
+    res.json({ template: updated });
+  } catch (err) {
+    if (/Paper template storage is not available/i.test(String(err?.message))) {
+      return res.status(503).json({ error: err.message, code: "PAPER_TEMPLATE_STORAGE_UNAVAILABLE", migrationRequired: true });
+    }
+    next(err);
+  }
+});
+
+// Delete one template.
+app.delete("/api/admin/templates/:id", requireAuth, requirePermission(PERMISSIONS.PAPERS_TEMPLATES_MANAGE), async (req, res, next) => {
+  try {
+    const deleted = await deletePaperTemplate(req.params.id);
+    if (!deleted) return res.status(404).json({ error: "Template not found.", code: "NOT_FOUND" });
+    res.json({ deleted: true, id: deleted.id });
+  } catch (err) {
+    if (/Paper template storage is not available/i.test(String(err?.message))) {
+      return res.status(503).json({ error: err.message, code: "PAPER_TEMPLATE_STORAGE_UNAVAILABLE", migrationRequired: true });
+    }
+    next(err);
+  }
+});
+
+function snapVariantFor(master, familyId, pick) {
+  const fam = (master.families ?? []).find((f) => f.family_id === familyId);
+  return fam ? pick(fam) : null;
+}
+
+// ---------------------------------------------------------------
+// Paper blueprint (Paper Generator Phase 2)
+// ---------------------------------------------------------------
+app.get("/api/admin/papers/:id/blueprint", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const result = await getPaperBlueprint(req.params.id);
+    if (!result) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+app.put("/api/admin/papers/:id/blueprint", requireAuth, requirePermission(PERMISSIONS.PAPERS_MANAGE), async (req, res, next) => {
+  try {
+    const existing = await getPaperById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    if (existing.paper.status === "archived") {
+      return res.status(409).json({
+        error: "Archived papers are read-only. Restore it to draft first.",
+        code: "ARCHIVED_ACTION_BLOCKED",
+        status: "archived",
+      });
+    }
+    const { blueprint: rawBlueprint } = req.body ?? {};
+    const { blueprint, errors } = normalizeBlueprint(rawBlueprint);
+    const validation = validateBlueprint(blueprint);
+    if (!errors.length && validation.errors.length > 0) {
+      return res.status(400).json({
+        error: "Blueprint is not logically consistent.",
+        code: "BLUEPRINT_INVALID",
+        validation,
+      });
+    }
+    const updated = await updatePaper(req.params.id, { blueprint });
+    if (!updated) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    res.json({ paper: updated.paper, blueprint, normalizationErrors: errors, validation });
+  } catch (err) { next(err); }
+});
+
+// Validate without saving. Accepts { blueprint } in the body; falls back to
+// the stored blueprint when no body is provided.
+app.post("/api/admin/papers/:id/blueprint/validate", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    let candidate = req.body?.blueprint;
+    if (candidate === undefined) {
+      const stored = await getPaperBlueprint(req.params.id);
+      if (!stored) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+      candidate = stored.blueprint;
+      if (candidate === null) {
+        return res.json({ valid: true, errors: [], warnings: ["No blueprint saved yet."], summary: null });
+      }
+    }
+    const { blueprint, errors } = normalizeBlueprint(candidate);
+    const validation = validateBlueprint(blueprint);
+    res.json({ valid: errors.length === 0 && validation.errors.length === 0, normalizationErrors: errors, ...validation });
+  } catch (err) { next(err); }
+});
+
+// Preview of expected paper composition + live availability per rule.
+app.post("/api/admin/papers/:id/blueprint/preview", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    let candidate = req.body?.blueprint;
+    if (candidate === undefined) {
+      const stored = await getPaperBlueprint(req.params.id);
+      if (!stored) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+      candidate = stored.blueprint;
+      if (candidate === null) {
+        return res.status(400).json({ error: "No blueprint saved for this paper.", code: "BLUEPRINT_MISSING" });
+      }
+    }
+    const { blueprint, errors } = normalizeBlueprint(candidate);
+    const validation = validateBlueprint(blueprint);
+
+    // Availability counts against the existing Question Bank via the same
+    // filter engine as listQuestions (no new query semantics).
+    const loadCounts = (filters) => countQuestions({ status: "published", ...filters });
+    const availability = await previewBlueprintAvailability(
+      { ...blueprint, standardId: req.body?.standardId ?? null, subjectId: req.body?.subjectId ?? null },
+      loadCounts
+    );
+
+    res.json({
+      validation: { errors, warnings: validation.warnings, summary: validation.summary },
+      sections: blueprint.sections.map((s) => ({
+        id: s.id,
+        name: s.name,
+        marksPerQuestion: s.marksPerQuestion,
+        negativeMarks: s.negativeMarks,
+        questionCount: s.questionCount,
+        marks: s.questionCount * s.marksPerQuestion,
+      })),
+      availability,
+    });
+  } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
+// Question selection (Paper Generator Phase 3)
+// ---------------------------------------------------------------
+// Generates the paper's question list from the stored blueprint using the
+// EXISTING Question Bank as source of truth. Modes:
+//   - automatic: fills every blueprint slot from the bank
+//   - hybrid:    body.lockFamilyIds are kept (consume demand first); the
+//                system fills only the remaining slots, never duplicating a
+//                locked family
+// Deterministic per (paperId, seed) so regenerating with the same seed
+// reproduces the exact same paper. On shortage: nothing is saved; the
+// response carries a structured shortage report instead.
+app.post("/api/admin/papers/:id/generate", requireAuth, requirePermission(PERMISSIONS.PAPERS_GENERATE), async (req, res, next) => {
+  try {
+    const stored = await getPaperBlueprint(req.params.id);
+    if (!stored) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    // A body blueprint acts as a dry-run override (nothing is persisted as
+    // blueprint); otherwise the stored blueprint is used.
+    const rawBlueprint = req.body?.blueprint ?? stored.blueprint;
+    if (rawBlueprint === null || rawBlueprint === undefined) {
+      return res.status(400).json({
+        error: "Save a blueprint before generating the paper.",
+        code: "BLUEPRINT_MISSING",
+        migrationRequired: stored.migrationRequired === true,
+      });
+    }
+
+    const { blueprint } = normalizeBlueprint(rawBlueprint);
+    const validation = validateBlueprint(blueprint);
+    if (validation.errors.length > 0) {
+      return res.status(400).json({
+        error: "Blueprint is not logically consistent — fix it before generating.",
+        code: "BLUEPRINT_INVALID",
+        validation,
+      });
+    }
+
+    // Locks: an explicit body list wins; otherwise every family flagged
+    // locked on the paper is pinned (Phase 5 editor "lock" action).
+    const current = await getPaperById(req.params.id);
+    if (!current) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    if (current.paper.status === "archived") {
+      return res.status(409).json({
+        error: "Archived papers are read-only. Restore it to draft first.",
+        code: "ARCHIVED_ACTION_BLOCKED",
+        status: "archived",
+      });
+    }
+    const lockFamilyIds = Array.isArray(req.body?.lockFamilyIds)
+      ? req.body.lockFamilyIds.filter((x) => typeof x === "string")
+      : current.families.filter((f) => f.locked).map((f) => f.family_id);
+    const seed = typeof req.body?.seed === "string" && req.body.seed.trim()
+      ? req.body.seed.trim()
+      : `paper:${req.params.id}`;
+    const strategy = req.body?.strategy === "seeded" || req.body?.strategy === "random" ? req.body.strategy : "seeded";
+    const effectiveSeed = strategy === "random" ? `${seed}:${randomBytes(8).toString("hex")}` : seed;
+
+    const result = await selectQuestionsForBlueprint(
+      { ...blueprint, standardId: stored.paper.standard_id, subjectId: stored.paper.subject_id },
+      (filters) => listQuestions({ status: "published", ...filters }),
+      lockFamilyIds,
+      effectiveSeed
+    );
+
+    if (!result.satisfied) {
+      // Shortage: save nothing, report precisely which constraints failed.
+      return res.status(409).json({
+        error: "Blueprint cannot be satisfied with the available questions.",
+        code: "BLUEPRINT_SHORTAGE",
+        shortages: result.shortages,
+      });
+    }
+
+    // Hybrid: locked families must remain in the paper. Keep them (with their
+    // marks, section assignment and locked flag) ahead of the fresh picks.
+    const existingRefs = new Map(
+      current.families.map((f) => [
+        f.family_id,
+        {
+          marks: Number(f.marks) || 0,
+          sectionKey: f.section_key ?? null,
+          locked: Boolean(f.locked),
+        },
+      ])
+    );
+    const lockedEntries = lockFamilyIds
+      .filter((fid) => existingRefs.has(fid))
+      .map((fid) => ({
+        familyId: fid,
+        marks: existingRefs.get(fid)?.marks ?? 0,
+        sectionKey: existingRefs.get(fid)?.sectionKey ?? undefined,
+        locked: true,
+      }));
+    // Fresh picks are assigned to their blueprint section (Phase 4).
+    const freshEntries = result.selections
+      .filter((s) => s.familyId)
+      .map((s) => ({
+        familyId: s.familyId,
+        marks: s.marks,
+        sectionKey: s.sectionId || undefined,
+      }));
+    const entries = [...lockedEntries, ...freshEntries];
+    const updated = await updatePaper(req.params.id, {}, entries);
+    if (!updated) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+
+    res.json({
+      generated: {
+        seed: effectiveSeed,
+        strategy,
+        total: entries.length,
+        totalMarks: entries.reduce((sum, e) => sum + e.marks, 0),
+      },
+      families: updated.families,
+      paper: updated.paper,
+    });
+  } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
+// Paper sets & randomization (Paper Generator Phase 7)
+// ---------------------------------------------------------------
+// One master paper generates multiple sets (A–D or custom count). Sets only
+// reorder questions/options of the SAME logical questions — no Question Bank
+// duplication. Each set stores its own seed + version so randomization is
+// reproducible; a per-set answer key is derived from the stored option
+// permutation.
+
+// List the stored sets document for a paper.
+app.get("/api/admin/papers/:id/sets", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const stored = await getPaperSets(req.params.id);
+    if (!stored) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    res.json({
+      paperId: stored.paper.id,
+      sets: stored.sets,
+      migrationRequired: stored.migrationRequired === true,
+    });
+  } catch (err) { next(err); }
+});
+
+// (Re-)generate sets. Body: { count?, labels?, shuffleQuestions?,
+// shuffleOptions?, baseSeed?, version? }. Version defaults to stored+1 so a
+// plain "regenerate" click deliberately re-randomizes, while regenerating
+// with an explicit version reproduces the original randomization.
+app.post("/api/admin/papers/:id/sets", requireAuth, requirePermission(PERMISSIONS.PAPERS_GENERATE), async (req, res, next) => {
+  try {
+    const loaded = await getPaperById(req.params.id);
+    if (!loaded) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    if (loaded.paper.status === "archived") {
+      return res.status(409).json({
+        error: "Archived papers are read-only. Restore it to draft first.",
+        code: "ARCHIVED_ACTION_BLOCKED",
+        status: "archived",
+      });
+    }
+    const stored = await getPaperSets(req.params.id);
+    const currentVersion = Number(stored?.sets?.version) || 0;
+    const options = {
+      count: req.body?.count,
+      labels: req.body?.labels,
+      shuffleQuestions: req.body?.shuffleQuestions,
+      shuffleOptions: req.body?.shuffleOptions,
+      baseSeed: req.body?.baseSeed,
+      version:
+        Number.isInteger(req.body?.version) && req.body.version >= 1
+          ? req.body.version
+          : currentVersion + 1,
+    };
+    const { doc, errors } = generateSetsDoc(loaded.paper, loaded.families, options);
+    if (!doc) {
+      return res.status(400).json({ error: errors[0], code: "SETS_INVALID", errors });
+    }
+    try {
+      await updatePaperSets(req.params.id, doc);
+    } catch (err) {
+      if (/Sets storage is not available/i.test(String(err?.message))) {
+        return res.status(503).json({
+          error: err.message,
+          code: "SETS_STORAGE_UNAVAILABLE",
+          migrationRequired: true,
+        });
+      }
+      throw err;
+    }
+    res.json({ paperId: req.params.id, sets: doc, warnings: errors, migrationRequired: stored?.migrationRequired === true });
+  } catch (err) { next(err); }
+});
+
+// Clear all sets from the master paper.
+app.delete("/api/admin/papers/:id/sets", requireAuth, requirePermission(PERMISSIONS.PAPERS_GENERATE), async (req, res, next) => {
+  try {
+    const existing = await getPaperById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    if (existing.paper.status === "archived") {
+      return res.status(409).json({
+        error: "Archived papers are read-only. Restore it to draft first.",
+        code: "ARCHIVED_ACTION_BLOCKED",
+        status: "archived",
+      });
+    }
+    try {
+      await updatePaperSets(req.params.id, null);
+    } catch (err) {
+      if (/Sets storage is not available/i.test(String(err?.message))) {
+        return res.status(503).json({
+          error: err.message,
+          code: "SETS_STORAGE_UNAVAILABLE",
+          migrationRequired: true,
+        });
+      }
+      throw err;
+    }
+    res.json({ deleted: true, paperId: req.params.id });
+  } catch (err) { next(err); }
+});
+
+// Independent answer key for one set (computed from the stored permutation,
+// never re-rolling the RNG — keys always match the stored set). Optional
+// `?language=<id>` resolves answers from that language's variants.
+app.get("/api/admin/papers/:id/sets/:key/answer-key", requireAuth, requirePermission(PERMISSIONS.PAPERS_REPORTS_VIEW), async (req, res, next) => {
+  try {
+    const stored = await getPaperSets(req.params.id);
+    if (!stored) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    if (!stored.sets) {
+      return res.status(400).json({
+        error: "No sets generated for this paper yet.",
+        code: "SETS_MISSING",
+        migrationRequired: stored.migrationRequired === true,
+      });
+    }
+    const language = typeof req.query.language === "string" ? req.query.language : null;
+    // Performance: batched variant loader — one 3-query batch for the whole set
+    // instead of two queries per question (N+1 on large papers/sets).
+    const key = language
+      ? await computeSetAnswerKeyInLanguage(stored.sets, req.params.key, language, listQuestionVariantsByFamilies)
+      : await computeSetAnswerKey(stored.sets, req.params.key, listQuestionVariantsByFamilies);
+    if (!key) {
+      return res.status(404).json({
+        error: `Set "${req.params.key}" does not exist on this paper.`,
+        code: "SET_NOT_FOUND",
+        availableKeys: stored.sets.sets.map((s) => s.key),
+      });
+    }
+    res.json({ paperId: stored.paper.id, ...key });
+  } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
+// Answer key & solutions reports (Paper Generator Phase 13)
+// ---------------------------------------------------------------
+// Both endpoints are derived from the paper's ACTUAL final structure on every
+// request, so numbering/answer mappings always match the paper — for the
+// master paper or any generated set, optionally resolved to a language. Data
+// comes from the Question Bank only; missing answers/solutions are reported,
+// never invented.
+//
+//   GET /api/admin/papers/:id/answer-key?set=A&language=<language_id>
+//   GET /api/admin/papers/:id/solutions?set=A&language=<language_id>
+
+async function buildPaperReportFor(req, res, includeContent) {
+  const loaded = await getPaperById(req.params.id);
+  if (!loaded) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+  const blueprint = await getPaperBlueprint(req.params.id).catch(() => null);
+  const stored = await getPaperSets(req.params.id).catch(() => null);
+
+  const setKey = typeof req.query.set === "string" && req.query.set.trim() ? req.query.set.trim() : null;
+  if (setKey && (!stored || !stored.sets || (stored.sets.sets ?? []).length === 0)) {
+    return res.status(400).json({
+      error: "No sets generated for this paper yet — generate sets first or omit ?set for the master paper report.",
+      code: "SETS_MISSING",
+      migrationRequired: stored?.migrationRequired === true,
+      scope: "master",
+    });
+  }
+  if (setKey && !(stored.sets.sets ?? []).some((s) => s.key === setKey)) {
+    return res.status(404).json({
+      error: `Set "${setKey}" does not exist on this paper.`,
+      code: "SET_NOT_FOUND",
+      availableKeys: (stored.sets.sets ?? []).map((s) => s.key),
+    });
+  }
+
+  const languageId = typeof req.query.language === "string" && req.query.language.trim()
+    ? req.query.language.trim()
+    : null;
+
+  const report = buildPaperReport({
+    paper: loaded.paper,
+    familyRefs: loaded.families,
+    blueprint: blueprint?.blueprint ?? null,
+    setsDoc: stored?.sets ?? null,
+    setKey,
+    languageId,
+    includeContent,
+  });
+  res.json({ paperId: loaded.paper.id, ...report });
+}
+
+// Compact answer key (question number -> answer) for master paper or a set.
+app.get("/api/admin/papers/:id/answer-key", requireAuth, requirePermission(PERMISSIONS.PAPERS_REPORTS_VIEW), async (req, res, next) => {
+  try { await buildPaperReportFor(req, res, false); } catch (err) { next(err); }
+});
+
+// Detailed solutions (question text, options, answer + explanation).
+app.get("/api/admin/papers/:id/solutions", requireAuth, requirePermission(PERMISSIONS.PAPERS_REPORTS_VIEW), async (req, res, next) => {
+  try { await buildPaperReportFor(req, res, true); } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
+// Paper analysis & quality report (Paper Generator Phase 14)
+// ---------------------------------------------------------------
+// Composition + blueprint variance computed from the paper's own data on every
+// request. Read-only; question content is never modified.
+app.get("/api/admin/papers/:id/analysis", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const loaded = await getPaperById(req.params.id);
+    if (!loaded) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    const [bp, chapters, topics, levels, languages] = await Promise.all([
+      getPaperBlueprint(req.params.id).catch(() => null),
+      listChapters().catch(() => []),
+      listTopics().catch(() => []),
+      listQuestionLevels().catch(() => []),
+      listLanguages().catch(() => []),
+    ]);
+    const analysis = buildPaperAnalysis(loaded.paper, loaded.families, bp?.blueprint ?? null, { chapters, topics, levels, languages });
+    res.json({ paperId: loaded.paper.id, ...analysis, migrationRequired: bp?.migrationRequired === true });
   } catch (err) { next(err); }
 });
 
@@ -1425,6 +2869,263 @@ app.post("/api/admin/questions/:id/link-variant", requireAuth, requirePermission
     const result = await linkQuestionToFamily(req.params.id, req.body?.family_id);
     if (!result) return res.status(404).json({ error: "Question not found.", code: "NOT_FOUND" });
     res.json({ question: result.question, family_id: result.family_id });
+  } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
+// Paper versioning & history (Paper Generator Phase 15)
+// ---------------------------------------------------------------
+// Immutable, insert-only versions of a paper's state. Historical published
+// versions are never mutated: restoring re-materialises a snapshot as a NEW
+// version. Automatic captures: v1 on creation, on every publish; admins can
+// also save a version manually or restore any past version.
+
+/**
+ * Best-effort capture of the paper's CURRENT live state as the next version.
+ * Never throws (capture must not break the create/publish that triggered it).
+ * Returns null when versioning storage is unavailable (migration 012 pending);
+ * { skipped: true, nextVersion } when nothing changed since the last version.
+ */
+async function capturePaperVersion(paperId, { reason = "manual", note = null, createdBy = null, template = null, parentVersion = null } = {}) {
+  try {
+    const [loaded, bp, sets] = await Promise.all([
+      getPaperById(paperId),
+      getPaperBlueprint(paperId).catch(() => null),
+      getPaperSets(paperId).catch(() => null),
+    ]);
+    if (!loaded) return null;
+    const languagePapers = await listLanguagePapers(paperId).catch(() => []);
+    const snapshot = buildPaperSnapshot(
+      loaded.paper,
+      loaded.families,
+      bp?.blueprint ?? null,
+      sets?.sets ?? null,
+      sets?.translations ?? null,
+      languagePapers,
+      template ?? null,
+    );
+
+    const latest = await getLatestPaperVersion(paperId).catch(() => null);
+    const nextVersion = latest ? latest.version + 1 : 1;
+
+    let changes;
+    let summary;
+    if (latest?.snapshot) {
+      changes = diffPaperSnapshots(latest.snapshot, snapshot);
+      summary = changes.summary;
+    } else {
+      const allLanguages = [...new Set(snapshot.families.flatMap((f) => f.languages ?? []))];
+      changes = {
+        changed: true,
+        additions: snapshot.families.map((f) => f.family_id),
+        removals: [],
+        replacements: [],
+        reorderCount: 0,
+        reordered: false,
+        marksChanged: [],
+        sectionsChanged: [],
+        blueprintChanged: snapshot.blueprint != null,
+        setsChanged: snapshot.sets != null,
+        translationsChanged: snapshot.translations != null,
+        languagePapersChanged: {
+          added: (snapshot.languagePapers ?? []).map((l) => ({ language_id: l.language_id, version: l.version, status: l.status })),
+          removed: [],
+        },
+        templateChanged: snapshot.template ? { from: null, to: snapshot.template } : null,
+        fieldChanges: [],
+        questionCount: { from: 0, to: snapshot.totals.questionCount },
+        totalMarks: { from: 0, to: snapshot.totals.totalMarks },
+        languagesChanged: { added: allLanguages, removed: [], affectedFamilies: snapshot.families.length },
+      };
+      summary = reason === "baseline" ? "Baseline captured for an existing paper" : "Initial version";
+      changes.summary = summary;
+    }
+
+    if (!changes.changed && !["created", "baseline", "restore"].includes(reason)) {
+      return { skipped: true, nextVersion };
+    }
+
+    const row = await insertPaperVersion({
+      paper_id: paperId,
+      version: nextVersion,
+      reason,
+      note: note ?? null,
+      summary,
+      changes,
+      snapshot,
+      created_by: createdBy,
+      parent_version: parentVersion,
+    });
+    if (!row) return null;
+    return {
+      version: row.version,
+      reason,
+      summary,
+      changes,
+      created_at: row.created_at,
+      skipped: false,
+    };
+  } catch (err) {
+    console.error("capturePaperVersion failed:", err);
+    return null;
+  }
+}
+
+/** Lazily seed a baseline version (v1) for papers created before versioning. */
+async function ensurePaperVersionBaseline(paperId, createdBy) {
+  const latest = await getLatestPaperVersion(paperId).catch(() => null);
+  if (latest) return { existing: true, version: latest.version };
+  const result = await capturePaperVersion(paperId, {
+    reason: "baseline",
+    note: "Baseline captured when the paper already existed (pre-versioning).",
+    createdBy,
+  });
+  if (!result) return { unavailable: true };
+  return { existing: false, version: result.version };
+}
+
+/** Version timeline for a paper (metadata + change summary per version). */
+app.get("/api/admin/papers/:id/versions", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const loaded = await getPaperById(req.params.id);
+    if (!loaded) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    const paperId = req.params.id;
+
+    let list = await listPaperVersions(paperId);
+    if (list.migrationRequired) {
+      return res.json({ paper: loaded.paper, versions: [], currentVersion: 0, createdVersion: 0, dirty: false, migrationRequired: true });
+    }
+    if (list.versions.length === 0) {
+      const seeded = await ensurePaperVersionBaseline(paperId, req.user.sub);
+      if (seeded.unavailable) {
+        return res.json({ paper: loaded.paper, versions: [], currentVersion: 0, createdVersion: 0, dirty: false, migrationRequired: true });
+      }
+      list = await listPaperVersions(paperId);
+    }
+
+    let dirty = false;
+    const latest = await getLatestPaperVersion(paperId).catch(() => null);
+    if (latest?.snapshot) {
+      const [bp, sets, languagePapers] = await Promise.all([
+        getPaperBlueprint(paperId).catch(() => null),
+        getPaperSets(paperId).catch(() => null),
+        listLanguagePapers(paperId).catch(() => []),
+      ]);
+      const current = buildPaperSnapshot(
+        loaded.paper, loaded.families,
+        bp?.blueprint ?? null, sets?.sets ?? null, sets?.translations ?? null,
+        languagePapers, null,
+      );
+      dirty = diffPaperSnapshots(latest.snapshot, current).changed;
+    }
+
+    res.json({
+      paper: { id: loaded.paper.id, title: loaded.paper.title, status: loaded.paper.status, updated_at: loaded.paper.updated_at },
+      versions: list.versions,
+      currentVersion: list.currentVersion,
+      createdVersion: list.createdVersion,
+      dirty,
+      migrationRequired: false,
+    });
+  } catch (err) { next(err); }
+});
+
+/** One full version row (immutable snapshot included) for View/Restore. */
+app.get("/api/admin/papers/:id/versions/:version", requireAuth, requirePermission(PERMISSIONS.PAPERS_VIEW), async (req, res, next) => {
+  try {
+    const version = parseInt(req.params.version, 10);
+    if (!Number.isInteger(version) || version < 1) {
+      return res.status(400).json({ error: "version must be a positive integer.", code: "VALIDATION" });
+    }
+    try {
+      const ver = await getPaperVersion(req.params.id, version);
+      if (!ver) return res.status(404).json({ error: "Paper version not found.", code: "NOT_FOUND" });
+      res.json(ver);
+    } catch (err) {
+      if (/Paper versioning is not available/i.test(String(err?.message))) {
+        return res.status(503).json({ error: err.message, code: "VERSIONING_UNAVAILABLE", migrationRequired: true });
+      }
+      throw err;
+    }
+  } catch (err) { next(err); }
+});
+
+/** Save the current draft state as a new version. Body: { reason?, note?, template? }. */
+app.post("/api/admin/papers/:id/versions", requireAuth, requirePermission(PERMISSIONS.PAPERS_MANAGE), async (req, res, next) => {
+  try {
+    const existing = await getPaperById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Paper not found.", code: "NOT_FOUND" });
+    const reason = req.body?.reason === "published" ? "published" : "manual";
+    const template = req.body?.template && (req.body.template.id || req.body.template.name)
+      ? { id: req.body.template.id ?? null, name: req.body.template.name ?? null }
+      : null;
+    const result = await capturePaperVersion(req.params.id, {
+      reason,
+      note: isSafeOptional(req.body?.note, 1000) ? req.body.note : undefined,
+      createdBy: req.user.sub,
+      template,
+    });
+    if (!result) {
+      return res.status(503).json({
+        error: "Paper versioning is not available: apply backend/migrations/012_paper_versioning.sql in the Supabase SQL editor.",
+        code: "VERSIONING_UNAVAILABLE",
+        migrationRequired: true,
+      });
+    }
+    if (result.skipped) {
+      return res.json({ created: false, message: "No changes since the last version.", paperId: req.params.id, currentVersion: result.nextVersion - 1 });
+    }
+    res.status(201).json({ created: true, paperId: req.params.id, version: result.version, reason, summary: result.summary, changes: result.changes, createdAt: result.created_at });
+  } catch (err) { next(err); }
+});
+
+/**
+ * Restore a historical version onto the live paper as a NEW version. The
+ * snapshot's composition/blueprint/sets/translations are re-materialised, the
+ * paper returns to draft for review, and the restored state is captured as
+ * version N+1 (parent_version = the version it restored). History is preserved.
+ */
+app.post("/api/admin/papers/:id/versions/:version/restore", requireAuth, requirePermission(PERMISSIONS.PAPERS_MANAGE), async (req, res, next) => {
+  try {
+    const version = parseInt(req.params.version, 10);
+    if (!Number.isInteger(version) || version < 1) {
+      return res.status(400).json({ error: "version must be a positive integer.", code: "VALIDATION" });
+    }
+    let ver;
+    try {
+      ver = await getPaperVersion(req.params.id, version);
+    } catch (err) {
+      if (/Paper versioning is not available/i.test(String(err?.message))) {
+        return res.status(503).json({ error: err.message, code: "VERSIONING_UNAVAILABLE", migrationRequired: true });
+      }
+      throw err;
+    }
+    if (!ver?.snapshot) return res.status(404).json({ error: "Paper version not found.", code: "NOT_FOUND" });
+
+    const restored = await restorePaperFromSnapshot(req.params.id, ver.snapshot);
+    const result = await capturePaperVersion(req.params.id, {
+      reason: "restore",
+      note: isSafeOptional(req.body?.note, 1000) ? req.body.note : `Restored from version ${version}`,
+      createdBy: req.user.sub,
+      parentVersion: version,
+    });
+    if (!result) {
+      // Restore applied but capture unavailable — surface it so the admin knows.
+      return res.json({
+        restored: true,
+        note: "Paper restored, but versioning storage is unavailable (migration 012 pending).",
+        migrationRequired: true,
+        skipped: restored.skipped,
+      });
+    }
+    res.status(201).json({
+      restored: true,
+      restoredFrom: version,
+      version: result.version,
+      summary: result.summary,
+      changes: result.changes,
+      skipped: restored.skipped,
+    });
   } catch (err) { next(err); }
 });
 

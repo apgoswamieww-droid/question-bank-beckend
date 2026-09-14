@@ -16,6 +16,7 @@ node_modules
 # Runtime data (contains password hashes + reset tokens)
 data/users.json
 data/resets.json
+data/roles.json
 
 # Editors / OS
 .vscode/*

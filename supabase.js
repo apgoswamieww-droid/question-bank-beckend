@@ -517,24 +517,70 @@ export async function replaceSubjectStandards(subjectId, standardIds) {
 // ---------------------------------------------------------------------------
 // Master Data: Chapters
 // ---------------------------------------------------------------------------
-export async function listChapters({ subject_id, standard_id } = {}) {
+export async function listChapters({ subject_id, standard_id, resource_type_ids } = {}) {
   if (!client) return [];
   let query = client.from("chapters").select("*").order("sort_order");
   if (subject_id) query = query.eq("subject_id", subject_id);
   if (standard_id) query = query.eq("standard_id", standard_id);
+
+  // If filtering by resource types, first get matching chapter IDs from junction table
+  if (resource_type_ids && resource_type_ids.length) {
+    const { data: crtRows, error: crtErr } = await client
+      .from("chapter_resource_types")
+      .select("chapter_id")
+      .in("resource_type_id", resource_type_ids);
+    if (crtErr) throw new Error(`Supabase chapters.list (crt): ${crtErr.message}`);
+    const chapterIds = [...new Set((crtRows || []).map((r) => r.chapter_id))];
+    if (chapterIds.length === 0) return [];
+    query = query.in("id", chapterIds);
+  }
+
   const { data, error } = await query;
   if (error) throw new Error(`Supabase chapters.list: ${error.message}`);
   return data;
 }
 
-export async function createChapter({ subject_id, standard_id, name, number, description, sort_order = 0 }) {
+// Get resource type IDs for a set of chapters
+export async function getChapterResourceTypes(chapterIds) {
+  if (!client || !chapterIds?.length) return {};
+  const { data, error } = await client
+    .from("chapter_resource_types")
+    .select("chapter_id, resource_type_id")
+    .in("chapter_id", chapterIds);
+  if (error) throw new Error(`Supabase chapter_resource_types.get: ${error.message}`);
+  const map = {};
+  for (const row of data || []) {
+    if (!map[row.chapter_id]) map[row.chapter_id] = [];
+    map[row.chapter_id].push(row.resource_type_id);
+  }
+  return map;
+}
+
+// Replace resource types for a chapter
+export async function setChapterResourceTypes(chapterId, resourceTypeIds) {
+  if (!client) return;
+  // Delete existing
+  await client.from("chapter_resource_types").delete().eq("chapter_id", chapterId);
+  // Insert new
+  const ids = [...new Set((resourceTypeIds || []).filter(Boolean))];
+  if (!ids.length) return;
+  const rows = ids.map((resource_type_id) => ({ chapter_id: chapterId, resource_type_id }));
+  const { error } = await client.from("chapter_resource_types").insert(rows);
+  if (error) throw new Error(`Supabase chapter_resource_types.set: ${error.message}`);
+}
+
+export async function createChapter({ subject_id, standard_id, resource_type_ids, name, number, description, sort_order = 0 }) {
   if (!client) throw new Error("Supabase not configured");
   const { data, error } = await client.from("chapters").insert({ subject_id, standard_id, name, number, description, sort_order }).select().single();
   if (error) throw new Error(`Supabase chapters.create: ${error.message}`);
+  // Link resource types
+  if (Array.isArray(resource_type_ids) && resource_type_ids.length) {
+    await setChapterResourceTypes(data.id, resource_type_ids);
+  }
   return data;
 }
 
-export async function updateChapter(id, { name, number, description, sort_order, active }) {
+export async function updateChapter(id, { name, number, description, sort_order, active, resource_type_ids }) {
   if (!client) return null;
   const patch = {};
   if (name !== undefined) patch.name = name;
@@ -544,6 +590,10 @@ export async function updateChapter(id, { name, number, description, sort_order,
   if (active !== undefined) patch.active = active;
   const { data, error } = await client.from("chapters").update(patch).eq("id", id).select().single();
   if (error) throw new Error(`Supabase chapters.update: ${error.message}`);
+  // Replace resource types if provided
+  if (Array.isArray(resource_type_ids)) {
+    await setChapterResourceTypes(id, resource_type_ids);
+  }
   return data;
 }
 
@@ -645,6 +695,59 @@ export async function deleteExamType(id) {
   const { error } = await client.from("exam_types").delete().eq("id", id);
   if (error) throw new Error(`Supabase exam_types.delete: ${error.message}`);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Master Data: Resource Types
+// ---------------------------------------------------------------------------
+export async function listResourceTypes() {
+  if (!client) return [];
+  const { data, error } = await client.from("resource_types").select("*").order("sort_order");
+  if (error) throw new Error(`Supabase resource_types.list: ${error.message}`);
+  return data;
+}
+
+export async function createResourceType({ name, code, description, sort_order = 0 }) {
+  if (!client) throw new Error("Supabase not configured");
+  const { data, error } = await client.from("resource_types").insert({ name, code, description, sort_order }).select().single();
+  if (error) throw new Error(`Supabase resource_types.create: ${error.message}`);
+  return data;
+}
+
+export async function updateResourceType(id, { name, code, description, sort_order, active }) {
+  if (!client) return null;
+  const patch = {};
+  if (name !== undefined) patch.name = name;
+  if (code !== undefined) patch.code = code;
+  if (description !== undefined) patch.description = description;
+  if (sort_order !== undefined) patch.sort_order = sort_order;
+  if (active !== undefined) patch.active = active;
+  const { data, error } = await client.from("resource_types").update(patch).eq("id", id).select().single();
+  if (error) throw new Error(`Supabase resource_types.update: ${error.message}`);
+  return data;
+}
+
+export async function deleteResourceType(id) {
+  if (!client) return false;
+  const { error } = await client.from("resource_types").delete().eq("id", id);
+  if (error) throw new Error(`Supabase resource_types.delete: ${error.message}`);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Tags: distinct tags across all questions
+// ---------------------------------------------------------------------------
+export async function listDistinctTags() {
+  if (!client) return [];
+  const { data, error } = await client.from("questions").select("tags");
+  if (error) throw new Error(`Supabase tags.list: ${error.message}`);
+  const tagSet = new Set();
+  for (const row of data || []) {
+    if (Array.isArray(row.tags)) {
+      for (const t of row.tags) tagSet.add(t);
+    }
+  }
+  return [...tagSet].sort();
 }
 
 // ---------------------------------------------------------------------------

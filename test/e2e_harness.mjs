@@ -19,6 +19,11 @@ const USERS_BACKUP = path.join(DATA_DIR, "users.e2e-backup.json");
 
 export function seedUsersFile() {
   mkdirSync(DATA_DIR, { recursive: true });
+  // Hermetic runs: clear fallback roles/reset files left by any earlier crashed
+  // or timed-out run — otherwise e.g. POST /admin/roles would 409 on a stale
+  // custom role with the same code.
+  rmSync(path.join(DATA_DIR, "roles.json"), { force: true });
+  rmSync(path.join(DATA_DIR, "resets.json"), { force: true });
   if (existsSync(USERS_FILE)) copyFileSync(USERS_FILE, USERS_BACKUP);
   const hash = bcrypt.hashSync("E2ePass!123", 4);
   const users = [

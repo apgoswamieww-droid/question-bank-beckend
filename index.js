@@ -44,6 +44,7 @@ import {
   createChapter,
   updateChapter,
   deleteChapter,
+  getChapterResourceTypes,
   listTopics,
   createTopic,
   updateTopic,
@@ -52,9 +53,16 @@ import {
   createExamType,
   updateExamType,
   deleteExamType,
+  // Resource Types
+  listResourceTypes,
+  createResourceType,
+  updateResourceType,
+  deleteResourceType,
   // Question Levels
   listQuestionLevels,
   createQuestionLevel,
+  // Tags
+  listDistinctTags,
   // Questions
   createQuestion,
   getQuestionById,
@@ -192,7 +200,7 @@ const corsOrigins = (process.env.CORS_ORIGINS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 app.use(cors(corsOrigins.length ? { origin: corsOrigins, credentials: true } : { origin: true, credentials: true }));
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "5mb" }));
 
 // ---------------------------------------------------------------
 // Authentication middleware
@@ -837,26 +845,36 @@ app.delete("/api/admin/subjects/:id", requireAuth, requireSuperAdmin, async (req
 // ---------------------------------------------------------------
 app.get("/api/admin/chapters", requireAuth, async (req, res, next) => {
   try {
-    const { subject_id, standard_id } = req.query ?? {};
-    const chapters = await listChapters({ subject_id, standard_id });
+    const { subject_id, standard_id, resource_type_ids } = req.query ?? {};
+    // Parse comma-separated resource_type_ids from query string
+    const rtIds = resource_type_ids ? resource_type_ids.split(",").filter(Boolean) : undefined;
+    const chapters = await listChapters({ subject_id, standard_id, resource_type_ids: rtIds });
+    // Attach resource type IDs to each chapter
+    if (chapters.length) {
+      const chapterIds = chapters.map((c) => c.id);
+      const crtMap = await getChapterResourceTypes(chapterIds);
+      for (const ch of chapters) {
+        ch.resource_type_ids = crtMap[ch.id] || [];
+      }
+    }
     res.json({ chapters });
   } catch (err) { next(err); }
 });
 
 app.post("/api/admin/chapters", requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
-    const { subject_id, standard_id, name, number, description, sort_order } = req.body ?? {};
+    const { subject_id, standard_id, resource_type_ids, name, number, description, sort_order } = req.body ?? {};
     if (!isSafeIdentifier(name)) return res.status(400).json({ error: "Name is required.", code: "VALIDATION" });
     if (!subject_id || !standard_id) return res.status(400).json({ error: "Subject and standard are required.", code: "VALIDATION" });
-    const created = await createChapter({ subject_id, standard_id, name: name.trim(), number, description, sort_order: sort_order ?? 0 });
+    const created = await createChapter({ subject_id, standard_id, resource_type_ids, name: name.trim(), number, description, sort_order: sort_order ?? 0 });
     res.status(201).json({ chapter: created });
   } catch (err) { next(err); }
 });
 
 app.patch("/api/admin/chapters/:id", requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
-    const { name, number, description, sort_order, active } = req.body ?? {};
-    const updated = await updateChapter(req.params.id, { name, number, description, sort_order, active });
+    const { name, number, description, sort_order, active, resource_type_ids } = req.body ?? {};
+    const updated = await updateChapter(req.params.id, { name, number, description, sort_order, active, resource_type_ids });
     if (!updated) return res.status(404).json({ error: "Not found.", code: "NOT_FOUND" });
     res.json({ chapter: updated });
   } catch (err) { next(err); }
@@ -966,6 +984,55 @@ app.delete("/api/admin/exam-types/:id", requireAuth, requireSuperAdmin, async (r
     const removed = await deleteExamType(req.params.id);
     if (!removed) return res.status(404).json({ error: "Not found.", code: "NOT_FOUND" });
     res.json({ deleted: true });
+  } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
+// Admin: Master Data — Resource Types
+// ---------------------------------------------------------------
+app.get("/api/admin/resource-types", requireAuth, async (_req, res, next) => {
+  try {
+    const resourceTypes = await listResourceTypes();
+    res.json({ resourceTypes });
+  } catch (err) { next(err); }
+});
+
+app.post("/api/admin/resource-types", requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const { name, code, description, sort_order } = req.body ?? {};
+    if (!isSafeIdentifier(name)) return res.status(400).json({ error: "Name is required.", code: "VALIDATION" });
+    const created = await createResourceType({ name: name.trim(), code, description, sort_order: sort_order ?? 0 });
+    res.status(201).json({ resourceType: created });
+  } catch (err) {
+    if (String(err?.message || "").includes("duplicate")) return res.status(409).json({ error: "Resource type already exists.", code: "DUPLICATE" });
+    next(err);
+  }
+});
+
+app.patch("/api/admin/resource-types/:id", requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const { name, code, description, sort_order, active } = req.body ?? {};
+    const updated = await updateResourceType(req.params.id, { name, code, description, sort_order, active });
+    if (!updated) return res.status(404).json({ error: "Not found.", code: "NOT_FOUND" });
+    res.json({ resourceType: updated });
+  } catch (err) { next(err); }
+});
+
+app.delete("/api/admin/resource-types/:id", requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const removed = await deleteResourceType(req.params.id);
+    if (!removed) return res.status(404).json({ error: "Not found.", code: "NOT_FOUND" });
+    res.json({ deleted: true });
+  } catch (err) { next(err); }
+});
+
+// ---------------------------------------------------------------
+// Admin: Tags — distinct tags across all questions
+// ---------------------------------------------------------------
+app.get("/api/admin/tags", requireAuth, requirePermission(PERMISSIONS.QUESTION_BANKS_VIEW), async (_req, res, next) => {
+  try {
+    const tags = await listDistinctTags();
+    res.json({ tags });
   } catch (err) { next(err); }
 });
 

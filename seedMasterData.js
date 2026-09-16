@@ -48,6 +48,13 @@ const EXAM_TYPES = [
   { name: "Olympiad", category: "competitive", sort_order: 12 },
 ];
 
+const RESOURCE_TYPES = [
+  { name: "NCERT", code: "NCERT", description: "National Council of Educational Research and Training", sort_order: 1 },
+  { name: "JEE", code: "JEE", description: "Joint Entrance Examination", sort_order: 2 },
+  { name: "NEET", code: "NEET", description: "National Eligibility cum Entrance Test", sort_order: 3 },
+  { name: "GUJCET", code: "GUJCET", description: "Gujarat Common Entrance Test", sort_order: 4 },
+];
+
 const LANGUAGES = [
   { code: "en", name: "English", native_name: "English" },
   { code: "gu", name: "Gujarati", native_name: "ગુજરાતી" },
@@ -142,6 +149,13 @@ async function seedSupabase() {
     if (error) console.error(`  exam_types error: ${error.message}`);
   }
   console.log(`  ✓ Exam Types: ${EXAM_TYPES.length} seeded`);
+
+  // 3b. Resource Types
+  for (const rt of RESOURCE_TYPES) {
+    const { error } = await client.from("resource_types").upsert(rt, { onConflict: "name" });
+    if (error) console.error(`  resource_types error: ${error.message}`);
+  }
+  console.log(`  ✓ Resource Types: ${RESOURCE_TYPES.length} seeded`);
 
   // 4. Languages
   for (const l of LANGUAGES) {
